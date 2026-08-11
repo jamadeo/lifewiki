@@ -217,7 +217,7 @@ Module sketch:
 src/main.rs        clap dispatch
 src/paths.rs       LIFEWIKI_HOME resolution, init
 src/event.rs       Event { id, ts, text }, serde, id/prefix handling
-src/log/mod.rs     Log: append, iterate, iterate_rev, resolve_prefix, since(id)
+src/log/mod.rs     Log: append, iterate, iterate_rev, resolve_prefix, since, upto
 src/log/writer.rs  locked append + fsync
 src/log/reader.rs  month-file discovery, torn-line handling
 src/cmd/*.rs       add, log, show, search, status, sync, doctor, redact
@@ -231,6 +231,14 @@ operation other than `append`. Shelling out to `git` avoids `libgit2` build
 friction and makes what we do trivially inspectable; swappable later behind a
 `Vcs` trait if it becomes a bottleneck.
 
+`since(id)` and `upto(id)` are both string comparisons on sorted ULIDs. They exist
+in phase 1 even though nothing consumes them yet, because the pipeline needs to
+replay bounded ranges of history to be reproducible while the log keeps growing
+(see "Designing for pipeline iteration" in [design.md](design.md)).
+
+`Log::open` takes the log directory as a parameter rather than reading a global —
+so tests, and later `lw rebuild --into`, can point at any directory.
+
 ### Phase 1 acceptance
 
 - `lw init` creates the home dir and the git repo.
@@ -241,5 +249,9 @@ friction and makes what we do trivially inspectable; swappable later behind a
 - `lw sync` commits pending events and pushes; `lw status` warns when events have
   been uncommitted for over 24h.
 - Month rollover works; a hand-truncated file is detected, not crashed on.
+- `since(id)` / `upto(id)` return the right half-open ranges, including at month
+  boundaries and for ids not present in the log.
+- A hand-written test corpus exists in `tests/corpora/` containing contradicting
+  facts, vague references, and out-of-order narration, ready for phase 2.
 - 10k appends stay well under a second each and the log parses in well under a
   second.

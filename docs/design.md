@@ -167,13 +167,51 @@ lw redact <id>         rewrite an event's text away (see event-log.md)
 
 Phase 1 is everything above except `build`, `rebuild`, `ask`, and `wiki`.
 
+## Designing for pipeline iteration
+
+Phase 1 records raw intent; the interesting work is the reconciliation algorithm,
+which we expect to rewrite repeatedly. So the architecture should treat "compare
+two versions of the pipeline over the same events" as a first-class operation,
+not something bolted on later. Three consequences:
+
+**A rebuild must be able to target an arbitrary directory.** `lw rebuild --into
+<dir>` lets us materialise the same log under prompt A and prompt B and `diff -r`
+the results. If the wiki path is hardcoded anywhere, this becomes painful, so it's
+a parameter from the first commit — even in phase 1, where nothing builds yet.
+
+**A rebuild must be able to stop at an event.** `lw rebuild --to <id>` bounds a
+run so results are reproducible as the log keeps growing. Cheap to provide,
+because ULIDs sort: it's a string comparison. This is the concrete reason phase 1
+exposes `Log::since(id)` and `Log::upto(id)` rather than just "read everything."
+
+**A test corpus is a real artifact.** Evaluating reconciliation needs events that
+deliberately contradict each other, arrive out of order, or reference things
+vaguely. That corpus should live in the repo (`tests/corpora/*.jsonl`) as plain
+log files — which they are, since a log is just JSONL. Writing one by hand while
+building phase 1 is also the best way to pressure-test the format.
+
+Note what makes all of this possible: the log is complete and verbatim, so any
+pipeline version can be run over any prefix of history at any time. Keeping phase
+1 dumb is what buys the freedom to be clever later.
+
+### Judging quality
+Deferred to phase 2, but the shape is worth stating: the useful signal is not a
+score, it's a **diff between successive pipeline versions over a fixed corpus**.
+Human review of "what changed and did it get better?" beats an automated metric
+here, because the thing being judged is whether a page reads correctly to the
+person whose life it describes. Every run already writes its transcript to
+`state/runs/`, which is what makes a bad edit explainable after the fact.
+
 ## Build order
 
-1. Event log + capture + read commands. Useful on day one as a journal, with no
-   model involved.
-2. Pipeline. Start dumb: append every event to a dated journal page. Then add
-   the model-driven page routing.
-3. Agent.
+1. **Event log + capture + read commands.** Useful on day one as a journal, with
+   no model involved. Plus a hand-written test corpus.
+2. **Pipeline.** First real milestone is retrieve-then-rewrite: search the wiki
+   for topics in the new event, hand candidate pages to the model, rewrite in
+   place. *Not* "append to a dated journal page" — that does no reconciliation, so
+   it would build a wiki full of contradictions and teach us nothing about the
+   hard part.
+3. **Agent.**
 
 ## Non-goals (for now)
 

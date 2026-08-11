@@ -64,10 +64,18 @@ Escape hatch if the bet fails: add an **optional** `revises` field and
 ### Phase 1 gets simpler, phase 2 gets harder
 Phase 1 is now a very small program: append lines, read lines back, commit, push.
 Almost no domain logic. The corollary is that phase 2 can't be the naive version
-I first sketched ("append each event to a dated journal page") for long — that
-does no reconciliation at all, so the wiki would accumulate contradictions. The
-first real milestone for phase 2 is retrieve-then-rewrite: find topically related
-pages, hand them to the model with the new event, rewrite in place.
+I first sketched ("append each event to a dated journal page") — that does no
+reconciliation at all, so the wiki would accumulate contradictions and teach us
+nothing about the hard part. The first milestone for phase 2 is
+retrieve-then-rewrite: find topically related pages, hand them to the model with
+the new event, rewrite in place.
+
+| # | Decision | Rationale |
+|---|----------|-----------|
+| S17 | `lw rebuild` takes `--into <dir>` and `--to <id>` | the pipeline is the part we expect to rewrite repeatedly, so materialising the same log under two prompt versions and `diff -r`-ing them must be trivial. Bounded replay keeps runs reproducible as the log grows |
+| S18 | `Log::open` takes a directory; nothing reads a global path | makes S17 and tests possible without special cases |
+| S19 | A hand-written test corpus lands in phase 1, at `tests/corpora/*.jsonl` | evaluating reconciliation needs deliberately contradictory and vague events; a corpus is just a log file, so this costs nothing. Writing one also pressure-tests the format while it's still cheap to change |
+| S20 | Quality is judged by diffing pipeline versions over a fixed corpus, not by a score | what's being judged is whether a page reads correctly to the person whose life it describes — human review of "what changed" is the honest signal |
 
 ### Backup latency (S12)
 You version the log primarily for backup, but the log is only committed at
