@@ -11,8 +11,9 @@
    `cat` and edit with vim if you must. No database unless something forces us
    to have one, and nothing so far does.
 4. **Structure is derived, not demanded.** The user should never have to pick a
-   category, fill a field, or learn a syntax. Classification is the language
-   model's job, downstream.
+   category, fill a field, learn a syntax, or link an event to an earlier one.
+   Classification *and reconciliation* are the language model's job, downstream.
+   A log event is three fields: id, timestamp, text.
 5. **Git for the mutable part.** The wiki changes constantly; git is already the
    best tool we have for "mutable but with an inspectable, revertible history".
 6. **Nondeterminism is quarantined.** Models only ever write to the wiki, never
@@ -78,15 +79,15 @@ machine — which is the thing we said versioning was *for*. So:
 
 Commits are made by `lw`, not by the user:
 
-- `log: add 01K2...` — one commit per capture (cheap, and gives you off-site
-  backup for free if you push somewhere)
+- `log: 12 events (01K2A..01K2M)` — pending captures, committed by `build`/`sync`
 - `wiki: fold 12 events (01K2A..01K2M)` — one commit per pipeline run
 
 ## Layer 1 — the event log
 
 Full spec in [event-log.md](event-log.md). In short: monthly JSONL files,
-ULID-based sortable IDs, one object per line holding `id`, `ts`, `text`, and
-optionally a typed relation to an earlier event.
+ULID-based sortable ids, one object per line holding exactly `id`, `ts`, `text`.
+No relations, no optional fields — an event is just something you said, when you
+said it.
 
 ## Layer 2 — the pipeline
 
@@ -104,10 +105,35 @@ optionally a typed relation to an earlier event.
 
 Guarantees we want: idempotent (re-running with no new events is a no-op),
 resumable (crash mid-run leaves a dirty tree we can reset), and auditable (every
-change traceable to a run and an event). An event with `revises` is handed to the
-model along with the event it supersedes, so the link never has to be guessed —
-though the model still has to read the prose to decide whether the old value
-should be erased or kept as history (see S6 in [decisions.md](decisions.md)).
+change traceable to a run and an event).
+
+### Reconciliation is the pipeline's core job
+
+Because the log has no relations (S6), *all* of the work of noticing that a new
+event contradicts an old fact happens here. "I actually prefer apples over
+oranges" must find the page saying oranges and rewrite it. This is not a
+side-feature; it is the main thing the pipeline does, and step 3 above has to be
+built around it rather than treating it as an edge case.
+
+Concretely, that shapes the design:
+
+- **The plan step must retrieve by *topic*, not just by novelty.** Before writing,
+  the model needs the existing pages that the event might contradict. Search the
+  wiki for salient nouns from the event text; unlike a `revises` pointer, this
+  works whether or not the user was explicit.
+- **Page conventions must state a default for supersession.** For stable facts
+  (favourite fruit, employer) the page shows the current value; for things whose
+  history is the point (jobs, addresses) it keeps a dated history. Encoding this
+  in the prompt and page templates, rather than per-event, is what makes the
+  model's judgement consistent.
+- **Failure must be visible.** If the model can't tell what an event refers to
+  ("I've changed my mind about that"), it should leave pages alone and append to
+  `wiki/unresolved.md` with the event id. Silent no-ops are the dangerous
+  outcome — a wiki confidently showing a stale fact.
+- **`lw rebuild` is the safety net.** Since the log is intact and complete, a
+  prompt improvement plus a rebuild retroactively fixes every reconciliation the
+  old prompt got wrong. This is what makes it acceptable to put this much
+  judgement in the model: mistakes are in a derived artifact, never in the data.
 
 Rebuilding from scratch (`lw rebuild`) replays the whole log into an empty wiki.
 Expensive, but it's the escape hatch that lets us change prompts and page
@@ -127,17 +153,15 @@ insufficient.
 lw init                create ~/.lifewiki and its git repo
 lw add <text>          append an event (also: piped stdin, or $EDITOR if no args)
 lw log [-n 20]         recent events
-lw show <id>           one event, its revision chain, and anything revising it
+lw show <id>           one event in full
 lw search <query>      literal/regex search of the log
-lw revise <id> <text>  append an event superseding an earlier one
-lw undo                revise away the event you just added
 lw status              pending events, last build, dirty state, backup age
 lw sync                commit pending events and push (no model, no build)
 lw build               fold new events into the wiki
 lw rebuild             rebuild the wiki from the whole log
 lw ask <question>      query the wiki
 lw wiki <page>         open/print a wiki page
-lw doctor [--repair]   integrity checks (torn lines, dangling revises)
+lw doctor [--repair]   integrity checks (torn lines, unparseable records)
 lw redact <id>         rewrite an event's text away (see event-log.md)
 ```
 

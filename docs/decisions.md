@@ -10,8 +10,8 @@ All phase-1 decisions are settled. Newer decisions are appended as they're made.
 | S2 | One file per month under `log/` | human-sized files, guessable names, bounded reverse reads | one big file (unbounded), one file per event (inode churn) |
 | S3 | ULID ids, prefix-matchable like git | sortable, offline, no counter, safe to retype | UUIDv4 (unsortable), sequence numbers (needs shared state), content hashes (not sortable, dupes collide) |
 | S4 | Timestamps are RFC 3339 with local offset | "2am" and "in Tokyo" are content, not presentation; still totally ordered | UTC only (destroys information), epoch ints (unreadable) |
-| S5 | Event has only `id`, `ts`, `text`, optional `revises` | no capture-time friction; the model has more context later than the user does now | required type/tags/category fields |
-| S6 | **One** relation, `revises`, as a bare id — no `kind` field | D4: prose already says whether something is a correction, an update, or a withdrawal, and the model reads the prose. A `kind` field with one value is dead weight | `correct`/`update`/`retract` as separate kinds (S6 v1, superseded); `{"kind":...,"target":...}` |
+| S5 | Event is exactly `id`, `ts`, `text` — no optional fields at all | no capture-time friction; the model has more context later than the user does now; one valid shape for a log line | required type/tags/category fields |
+| S6 | **No relations in the log.** Revision is expressed as an ordinary new event; the pipeline reconciles it against the wiki | D4 taken to its conclusion: if prose can describe a revision, a link field is redundant. The pipeline had to handle unlinked revisions anyway, so the field bought nothing it didn't already need | `correct`/`update`/`retract` kinds (v1); a single bare `revises` id (v2); both superseded |
 | S7 | Log and wiki share one git repo, and the log **is** versioned | D1 + D9: one `push` backs up the one thing that can't be regenerated. Accepted cost: `lw redact` can't fully erase | two repos; unversioned log + `state/digests` integrity check |
 | S8 | Shell out to the `git` binary | no build friction, trivially inspectable, behind a trait if needed later | `libgit2`/`gix` |
 | S9 | No index, no cache, full parse on read | a year of heavy use is a few MB; an index is a rebuildable optimisation, not architecture | sqlite index, in-memory daemon |
@@ -31,31 +31,43 @@ All phase-1 decisions are settled. Newer decisions are appended as they're made.
 
 ## Consequences worth remembering
 
-### Collapsing relations to a single `revises` (S6)
-The record loses a level of nesting. Instead of:
+### Removing relations entirely (S6)
+The log went through three shapes before landing: `{kind, target}`, then a bare
+`revises` id, then nothing. The final step was the right one — once prose is
+accepted as sufficient to *describe* a revision, a field pointing at the revised
+event is redundant, because the pipeline must cope with unlinked revisions anyway
+(users will just `lw add`, and should be able to). A field used sometimes, whose
+absence must be handled regardless, is pure cost.
 
-```json
-"rel": {"kind": "correct", "target": "01JZ8..."}
-```
+An event is now three required fields with no `Option`s, so there is exactly one
+valid shape for a log line. `lw revise` and `lw undo` are both gone from the CLI.
 
-just:
+**This moves real risk into the pipeline**, and that should be tracked as the
+project's main technical risk:
 
-```json
-"revises": "01JZ8..."
-```
+- A missed reconciliation means the wiki *silently* shows a stale fact. Nothing
+  in the log marks the contradiction; only the model noticing it does.
+- "Erase the old value" vs. "keep a dated history" is decided entirely by the
+  model reading prose. Page conventions in the prompt have to set the default,
+  or the wiki will be inconsistent about it.
+- Ambiguous events ("I've changed my mind about that") are genuinely
+  unresolvable. The pipeline must prefer flagging to guessing —
+  `wiki/unresolved.md` exists so failures are visible.
 
-`revises` means only "this event supersedes that one; read my text to find out
-how." Withdrawal is `lw revise <id> "forget this, it never happened"` — no
-separate `retract`. This goes slightly further than D4 asked (you dropped
-`correct`/`update` but didn't mention `retract`), on the grounds that the same
-argument kills it: the pipeline was always going to read the text anyway.
+What makes this acceptable: the log is complete and verbatim, so every
+reconciliation error is a defect in a *derived* artifact. Improving the prompt and
+running `lw rebuild` fixes the past. The data is never what was wrong.
 
-The cost: the pipeline can no longer branch on relation type without reading
-prose, so "should the wiki keep a history of the old value?" becomes a model
-judgement rather than a user declaration. Given that you expect `revise` to be
-rare, that seems like the right place to spend the uncertainty. If the pipeline
-turns out to systematically get "erase" vs. "keep history" wrong, the fix is to
-reintroduce `kind` as an *optional* field — additive, so no migration.
+Escape hatch if the bet fails: add an **optional** `revises` field and
+`lw add --revises <id>`. Purely additive, no migration, no old event invalidated.
+
+### Phase 1 gets simpler, phase 2 gets harder
+Phase 1 is now a very small program: append lines, read lines back, commit, push.
+Almost no domain logic. The corollary is that phase 2 can't be the naive version
+I first sketched ("append each event to a dated journal page") for long — that
+does no reconciliation at all, so the wiki would accumulate contradictions. The
+first real milestone for phase 2 is retrieve-then-rewrite: find topically related
+pages, hand them to the model with the new event, rewrite in place.
 
 ### Backup latency (S12)
 You version the log primarily for backup, but the log is only committed at

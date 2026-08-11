@@ -27,14 +27,26 @@ Design phase. Nothing is implemented yet.
 ## The three layers
 
 **1. The log** is the source of truth. It is append-only and stores your words
-exactly as you typed them. Facts change, but the log never does: a change is a new
-event that points at an older one. Capture is instant, offline, and never
-touches a language model.
+exactly as you typed them. An event is three fields — an id, a timestamp, and your
+text. Nothing else: no tags, no categories, no links between entries.
+
+Facts change, but the log never does. You just say the new thing:
+
+```
+$ lw add "oranges are my favorite fruit"
+...weeks later...
+$ lw add "I actually prefer apples over oranges now"
+```
+
+Both lines live in the log forever. The wiki is what changes — the pipeline finds
+the page that says oranges and rewrites it to say apples. Capture is instant,
+offline, and never touches a language model.
 
 **2. The wiki** is a derived artifact: a directory of Markdown pages, mutable,
-rewritten by the pipeline as new events arrive. Because it lives in a git repo,
-every rewrite is a commit — you can diff, blame, browse, and revert. If the wiki
-is ever lost or corrupted it can be rebuilt from the log.
+rewritten by the pipeline as new events arrive. Reconciling new facts against old
+ones is its central job. Because it lives in a git repo, every rewrite is a
+commit — you can diff, blame, browse, and revert. If the wiki is ever wrong, the
+log is still right: improve the prompt, run `lw rebuild`, and the past is fixed.
 
 **3. The agent** answers questions by searching the wiki (and, when needed, the
 log behind it) and citing what it found.

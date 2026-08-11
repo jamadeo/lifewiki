@@ -15,7 +15,7 @@ log/2026-08.jsonl
 
 ```json
 {"id":"01K2C4V8YQ3XKQ2S9F1N7B0M4E","ts":"2026-08-11T12:47:03-04:00","text":"Started running again, 3km around the park."}
-{"id":"01K2C57TDA6P1YQ8W3ZR4H2J9C","ts":"2026-08-11T13:02:44-04:00","text":"Ada's birthday is the 14th of March, not the 4th.","revises":"01JZ8QF2M6TB0X4WKD7YV3N1RS"}
+{"id":"01K2C57TDA6P1YQ8W3ZR4H2J9C","ts":"2026-08-11T13:02:44-04:00","text":"Ada's birthday is the 14th of March, not the 4th."}
 ```
 
 Why JSONL:
@@ -43,17 +43,19 @@ Files are written **without** a trailing incomplete line: every line ends `\n`.
 Exactly four possible top-level keys, written in this fixed order so diffs stay
 stable:
 
-| key       | type   | required | meaning |
-|-----------|--------|----------|---------|
-| `id`      | string | yes      | ULID, uppercase Crockford base32, 26 chars |
-| `ts`      | string | yes      | RFC 3339 with local UTC offset |
-| `text`    | string | yes      | exactly what the user typed, unmodified |
-| `revises` | string | no       | id of an earlier event this one supersedes |
+Exactly three keys, no optional fields, written in this fixed order so diffs stay
+stable:
 
-That's it. No tags, no categories, no title, no type field. Structure is the
-pipeline's job — anything we ask the user to fill in is friction at the moment we
-most need there to be none, and a decision made with less context than the model
-will have later.
+| key    | type   | meaning |
+|--------|--------|---------|
+| `id`   | string | ULID, uppercase Crockford base32, 26 chars |
+| `ts`   | string | RFC 3339 with local UTC offset |
+| `text` | string | exactly what the user typed, unmodified |
+
+That's it. No tags, no categories, no title, no type field, and no relations.
+Structure is the pipeline's job — anything we ask the user to fill in is friction
+at the moment we most need there to be none, and a decision made with less
+context than the model will have later.
 
 ### `id` — ULID
 
@@ -61,11 +63,13 @@ will have later.
 offline. Sortable IDs mean "events after X" is a string comparison and the log's
 natural file order is chronological, with no counter to keep or collisions to
 worry about. Uppercase Crockford base32 is case-insensitive and unambiguous when
-read aloud or retyped, which matters because the user will be typing these into
-`lw revise <id>`.
+read aloud or retyped.
 
-Commands accept an unambiguous **prefix** of an id (like git), minimum 4
-characters.
+With `lw revise` gone, ids are rarely typed by a human — they're mostly for the
+pipeline to cite provenance ("this wiki line came from event 01K2C5…") and for
+`lw show`/`lw redact`. Commands still accept an unambiguous **prefix** (like git),
+minimum 4 characters, since the times you *do* type one you shouldn't have to
+type 26 characters.
 
 ### `ts` — local time, with offset
 
@@ -91,45 +95,59 @@ from `$EDITOR`).
 No markup is interpreted. If the user writes `#running` or `@ada` it's just
 text — though the pipeline is free to treat it as a hint.
 
-### `revises` — how facts change
+## How facts change: they don't, here
 
-The log is immutable, so a change is a new event pointing at an old one. There is
-exactly **one** relation, and it carries no type:
+The log has **no relations** and no way to express "this supersedes that." You
+just write the new thing in your own words:
 
-```json
-{"id":"01K2C5...","ts":"...","text":"I've left Acme.","revises":"01JZ8Q..."}
+```
+lw add "oranges are my favorite fruit"
+...weeks later...
+lw add "I actually prefer apples over oranges now"
 ```
 
-`revises` means *"this event supersedes that one; read my text to find out how."*
-Corrections, updates and withdrawals are all the same shape:
+Both events stay in the log forever, exactly as typed. The *wiki* is where
+reconciliation happens: the pipeline sees the new event, finds the page that says
+oranges, and rewrites it to say apples. The log is the history; the wiki is the
+current truth.
 
-| you write | effect |
-|-----------|--------|
-| `lw revise 01JZ8Q "Ada's birthday is March 14th, not the 4th"` | correction — the old value was never true |
-| `lw revise 01JZ8Q "I've left Acme"` | update — the old value was true then |
-| `lw revise 01JZ8Q "forget this, it never happened"` | withdrawal |
+This is the design's central bet, so it's worth stating what it rests on:
 
-**Why no `kind` field.** An earlier draft had `correct`/`update`/`retract`, on the
-theory that the wiki should erase a corrected value but keep history for an
-updated one, and only the user can tell those apart. But the user's prose already
-says which it is, and the pipeline reads the prose regardless — so the field was
-asking for a declaration the model was going to re-derive anyway. One relation,
-no enum, no nesting.
+- **Prose already carries the intent.** "I actually prefer apples" says it's a
+  change, "I've left Acme" says the old fact expired, "forget that, it never
+  happened" says withdraw it. A structured field would be asking you to declare
+  something your sentence already said — and which the model must read anyway.
+- **The pipeline has more context than you do at capture time.** It can see every
+  page and every prior event; at 7am typing one line, you can't remember which
+  event id said what about fruit. Making you supply a link is asking for the one
+  input you're worst positioned to give.
+- **Any relation field is optional in practice.** Even with `lw revise`, the
+  common case is a plain `lw add` and the pipeline coping anyway. So the pipeline
+  needs to handle unlinked revisions *regardless* — which makes the field
+  redundant rather than merely inconvenient.
 
-The cost, recorded honestly: "erase the old value" vs. "keep it as history" is
-now a model judgement rather than a user declaration. Acceptable because revision
-is expected to be rare. If the pipeline gets it systematically wrong, we
-reintroduce `kind` as an *optional* field — purely additive, no migration.
+### What this costs
 
-Rules: the target must exist and must be an earlier id. Revisions may chain (C
-revises B revises A) and the pipeline resolves to the newest live version. A
-non-chaining "reply/annotation" relation is deliberately omitted — plain new
-events are usually the right answer.
+Recorded plainly, because it's a real transfer of risk from the log to the model:
 
-Note that revision is a *hint to the pipeline*, not a requirement. Writing "oh,
-Ada's birthday is actually March 14th" as a plain event is perfectly valid and
-the pipeline should cope; `revises` just makes the link explicit and unambiguous
-so it doesn't have to guess which earlier fact you meant.
+- **Stale facts are now a pipeline bug, not a data property.** If the model fails
+  to connect "I prefer apples" to the oranges page, the wiki is silently wrong
+  and nothing in the log marks the contradiction. The mitigation is that the log
+  is intact, so a better prompt plus `lw rebuild` fixes it retroactively — the
+  data is never the thing that was wrong.
+- **Erase vs. keep-history is entirely a model judgement.** Whether the wiki
+  should show "prefers apples" or "preferred oranges until Aug 2026, now apples"
+  is decided by the pipeline reading your prose. Page conventions in the prompt
+  will have to set the default (see the pipeline design).
+- **Ambiguous references may resolve wrongly.** "I've changed my mind about that"
+  with no antecedent is genuinely unresolvable. The pipeline should prefer
+  leaving the wiki unchanged and flagging the event over guessing — a
+  `wiki/unresolved.md` for events it couldn't place, so failures are visible
+  rather than silent.
+
+If this bet fails, the recovery path is additive and cheap: add an **optional**
+`revises` field later and teach `lw add --revises <id>`. Old events remain valid,
+no migration. Nothing about starting simple forecloses it.
 
 ## Writing safely
 
@@ -198,12 +216,15 @@ Module sketch:
 ```
 src/main.rs        clap dispatch
 src/paths.rs       LIFEWIKI_HOME resolution, init
-src/event.rs       Event, serde, id/prefix handling
+src/event.rs       Event { id, ts, text }, serde, id/prefix handling
 src/log/mod.rs     Log: append, iterate, iterate_rev, resolve_prefix, since(id)
 src/log/writer.rs  locked append + fsync
 src/log/reader.rs  month-file discovery, torn-line handling
-src/cmd/*.rs       add, log, show, search, revise, undo, status, sync
+src/cmd/*.rs       add, log, show, search, status, sync, doctor, redact
 ```
+
+`Event` is a three-field struct with no `Option`s, which keeps serde trivial and
+means there is exactly one valid shape for a log line.
 
 `Log` is the only thing allowed to touch `log/`, and it exposes no mutating
 operation other than `append`. Shelling out to `git` avoids `libgit2` build
@@ -215,10 +236,8 @@ friction and makes what we do trivially inspectable; swappable later behind a
 - `lw init` creates the home dir and the git repo.
 - `lw add "text"`, piped stdin, and `$EDITOR` with no args all produce one line.
 - Multi-line, emoji, quotes and 100 KB entries all round-trip byte-identically.
-- `lw log`, `lw show`, `lw search` read it back; ids resolve by prefix.
-- `lw revise <id> "..."` writes a valid `revises`; a nonexistent, ambiguous, or
-  not-earlier target is rejected with a useful message.
-- `lw show <id>` lists events that revise it, and the chain it revises.
+- `lw log`, `lw show`, `lw search` read it back; ids resolve by prefix, and an
+  ambiguous prefix is an error listing the candidates.
 - `lw sync` commits pending events and pushes; `lw status` warns when events have
   been uncommitted for over 24h.
 - Month rollover works; a hand-truncated file is detected, not crashed on.
