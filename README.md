@@ -35,4 +35,5 @@ directory.
 - [`docs/design.md`](docs/design.md) — architecture and principles
 - [`docs/event-log.md`](docs/event-log.md) — the log format and behavioral contract
 - [`docs/wiki-format.md`](docs/wiki-format.md) — phase 2: wiki pages as an OKF subset
+- [`docs/pipeline.md`](docs/pipeline.md) — phase 2: what reconciliation must solve
 - [`docs/decisions.md`](docs/decisions.md) — decision record and open questions
