@@ -30,7 +30,8 @@ impl Log {
         let event = Event {
             id: ulid::Ulid::new().to_string(),
             ts: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            text,
+            text: Some(text),
+            redacted: None,
         };
         let month = now.format("%Y-%m").to_string();
         let record = serde_json::to_string(&event)? + "\n";
@@ -117,13 +118,13 @@ impl Log {
                 let mut found = false;
                 let mut lines = Vec::new();
                 for line in raw.lines() {
-                    let mut value: serde_json::Value = serde_json::from_str(line)?;
-                    if value.get("id").and_then(|id| id.as_str()) == Some(&event.id) {
-                        value["text"] = serde_json::Value::Null;
-                        value["redacted"] = serde_json::Value::String(reason.to_string());
+                    let mut record: Event = serde_json::from_str(line)?;
+                    if record.id == event.id {
+                        record.text = None;
+                        record.redacted = Some(reason.to_string());
                         found = true;
                     }
-                    lines.push(serde_json::to_string(&value)?);
+                    lines.push(serde_json::to_string(&record)?);
                 }
                 if found {
                     let temp = path.with_extension("jsonl.tmp");

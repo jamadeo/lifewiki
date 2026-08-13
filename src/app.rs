@@ -63,7 +63,7 @@ pub fn run() -> Result<()> {
                     "{}  {}  {}",
                     event.id,
                     event.ts,
-                    event.text.replace('\n', "\\n")
+                    event.one_line()
                 );
             }
             Ok(())
@@ -71,19 +71,19 @@ pub fn run() -> Result<()> {
         CommandName::Show { id } => {
             paths::require_initialized(&home)?;
             let event = Log::open(&home)?.resolve_prefix(&id)?;
-            println!("{}\n{}\n{}", event.id, event.ts, event.text);
+            println!("{}\n{}\n{}", event.id, event.ts, event.text());
             Ok(())
         }
         CommandName::Search { query } => {
             paths::require_initialized(&home)?;
             let regex = regex(&query)?;
             for event in Log::open(&home)?.events()? {
-                if regex.is_match(&event.text) {
+                if regex.is_match(event.text()) {
                     println!(
                         "{}  {}  {}",
                         event.id,
                         event.ts,
-                        event.text.replace('\n', "\\n")
+                        event.one_line()
                     );
                 }
             }
