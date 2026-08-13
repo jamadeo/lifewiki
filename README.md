@@ -30,5 +30,9 @@ directory.
 - `lw doctor [--repair]`
 - `lw redact <id-prefix> --reason <reason>`
 
-See [`docs/event-log.md`](docs/event-log.md) for the format and behavioral
-contract.
+## Documentation
+
+- [`docs/design.md`](docs/design.md) — architecture and principles
+- [`docs/event-log.md`](docs/event-log.md) — the log format and behavioral contract
+- [`docs/wiki-format.md`](docs/wiki-format.md) — phase 2: wiki pages as an OKF subset
+- [`docs/decisions.md`](docs/decisions.md) — decision record and open questions

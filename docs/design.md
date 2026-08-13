@@ -31,9 +31,9 @@ One directory, one git repo, default `~/.lifewiki` (override with
 ├── log/
 │   ├── 2026-07.jsonl     # append-only, one JSON object per line
 │   └── 2026-08.jsonl
-├── wiki/
-│   ├── index.md
-│   ├── people/ada.md
+├── wiki/                 # an OKF v0.2 bundle (subset); see wiki-format.md
+│   ├── index.md          # progressive-disclosure directory listing
+│   ├── people/ada.md     # markdown + YAML frontmatter, cites log events
 │   ├── projects/lifewiki.md
 │   └── journal/2026-08-11.md
 └── state/
@@ -91,6 +91,12 @@ said it.
 
 ## Layer 2 — the pipeline
 
+Pages are written as a subset of [OKF v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
+— markdown with YAML frontmatter carrying provenance and trust metadata. Rationale
+and exactly which subset in [wiki-format.md](wiki-format.md). Note that OKF
+contributes nothing to reconciliation; it standardises how pages *record* what
+they know and where it came from, not how contradictions get resolved.
+
 `lw build` folds new events into the wiki. Sketch of the loop:
 
 1. Read `state/cursor.json`, collect events after it.
@@ -99,7 +105,9 @@ said it.
    what needs to change? The model sees the batch, the current content of
    candidate pages, and a page index.
 4. Apply edits page by page (model returns whole-file rewrites — simpler and
-   more reliable than diffs at this scale).
+   more reliable than diffs at this scale). Pages are OKF-subset markdown, so
+   each rewrite must also carry correct frontmatter: updated `generated`, and
+   `sources` citing the events behind the claims (see wiki-format.md).
 5. Commit the wiki changes, advance the cursor, write the transcript to
    `state/runs/<timestamp>/` so a weird edit can be explained after the fact.
 
@@ -161,7 +169,7 @@ lw build               fold new events into the wiki
 lw rebuild             rebuild the wiki from the whole log
 lw ask <question>      query the wiki
 lw wiki <page>         open/print a wiki page
-lw doctor [--repair]   integrity checks (torn lines, unparseable records)
+lw doctor [--repair]   integrity checks (log torn lines; wiki OKF conformance)
 lw redact <id>         rewrite an event's text away (see event-log.md)
 ```
 

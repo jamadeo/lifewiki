@@ -29,6 +29,34 @@ All phase-1 decisions are settled. Newer decisions are appended as they're made.
 |---|-------|------|
 | D7 | Model provider | Deferred entirely; you have a crate in mind. Phase 1 touches no model, so this blocks nothing. `config.toml` gains a `[model]` table when we get there |
 
+## Open (phase 2, raised by S21)
+
+### D10. How many `sources` does a page keep?
+OKF assumes a handful of sources per concept. Ours accrete indefinitely — a page
+about a person could reach hundreds of event citations over years, which bloats
+frontmatter past usefulness. Options: (a) cite only events that support
+*currently stated* claims, dropping citations when a claim is rewritten (keeps
+frontmatter proportional to content; loses the audit trail, though git and the log
+both still have it); (b) keep everything and accept bloat; (c) cap at N most
+recent. I lean **(a)** — the page cites what it currently says, and history lives
+in git and the log where it belongs.
+
+### D11. Does `verified` make pages partly hand-editable?
+OKF's trust tiers give us a machine-readable "a human confirmed this" marker,
+which suggests letting you edit a page directly and mark it `verified: human:jack`
+so the pipeline treats it as more authoritative and won't casually overwrite it.
+
+Tempting, but it puts a crack in "the wiki is purely derived": a hand-edit is
+content that exists nowhere in the log, so `lw rebuild` destroys it. Options:
+(a) wiki stays strictly derived, `verified` only ever set by a `lw review`
+command that records approval without changing text; (b) hand-edits allowed, and
+`lw rebuild` preserves human-verified sections; (c) hand-edits allowed, and the
+diff of your edit is appended to the log as an event so it survives rebuilds.
+
+(c) is the only one that keeps the log as complete truth, and it's appealing — but
+it means the log gains events the user didn't type, which cuts against "verbatim
+what you said." Needs a decision before `verified` is written by anything.
+
 ## Consequences worth remembering
 
 ### Removing relations entirely (S6)
@@ -76,6 +104,7 @@ the new event, rewrite in place.
 | S18 | `Log::open` takes a directory; nothing reads a global path | makes S17 and tests possible without special cases |
 | S19 | A hand-written test corpus lands in phase 1, at `tests/corpora/*.jsonl` | evaluating reconciliation needs deliberately contradictory and vague events; a corpus is just a log file, so this costs nothing. Writing one also pressure-tests the format while it's still cheap to change |
 | S20 | Quality is judged by diffing pipeline versions over a fixed corpus, not by a score | what's being judged is whether a page reads correctly to the person whose life it describes — human review of "what changed" is the honest signal |
+| S21 | Wiki pages follow a **subset of OKF v0.2**: `type`/`title`/`description`/`tags`, `generated`, `verified`, `sources` + footnote attribution, `index.md`. Skip attested computations, `log.md`, `stale_after` | the substrate (markdown + YAML frontmatter in git) is what we'd already chosen, and OKF standardises the provenance/trust conventions we'd left as TBD. Full assessment in [wiki-format.md](wiki-format.md) | inventing our own frontmatter conventions; adopting OKF wholesale; plain markdown with no frontmatter |
 
 ### Backup latency (S12)
 You version the log primarily for backup, but the log is only committed at
