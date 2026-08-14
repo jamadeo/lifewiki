@@ -1572,6 +1572,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "goose-local-inference",
  "goose-provider-types",
  "include_dir",
  "reqwest",

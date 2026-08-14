@@ -15,9 +15,7 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"
 goose-agent = "0.1.0-alpha.6"
-# rustls-tls is not optional: goose-providers defaults to no TLS backend, and
-# without one every HTTPS request fails as "could not connect".
-goose-providers = { version = "0.1.0-alpha.6", features = ["rustls-tls"] }
+goose-providers = { version = "0.1.0-alpha.6", features = ["rustls-tls", "local-inference"] }
 goose-local-inference = { version = "0.1.0-alpha.6", optional = true }
 libc = "0.2"
 regex = "1.11"

@@ -9,80 +9,199 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(name = "lw", about = "A local-first personal event log")]
+#[command(
+    name = "lw",
+    about = "A local-first personal event log that builds itself into a wiki",
+    long_about = "lifewiki records what you tell it about your life to an \
+append-only log, then uses a language model to fold those notes into a \
+version-controlled wiki.\n\n\
+The log is the source of truth and is never edited. The wiki is derived, so it \
+can always be thrown away and rebuilt from the log.",
+    after_help = "Run `lw <command> --help` for details on any command.",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: CommandName,
 }
+
 #[derive(Subcommand)]
 enum CommandName {
+    /// Create a new lifewiki repository.
+    ///
+    /// Creates log/, wiki/ and state/ under ~/.lifewiki (or $LIFEWIKI_HOME),
+    /// writes a default config.toml and .gitignore, and makes the first git
+    /// commit. Safe to re-run: existing files are left alone.
     Init,
+
+    /// Record something in the log.
+    ///
+    /// The text is stored verbatim and never edited afterwards. Write in plain
+    /// prose; there are no tags, types or categories to choose. To correct or
+    /// update something, just say so in a new entry — the wiki build works out
+    /// what changed:
+    ///
+    ///   lw add "Ada's birthday is the 14th, not the 4th"
+    ///
+    /// With no arguments, reads stdin if it is piped, otherwise opens $EDITOR.
+    /// However the text arrives, one invocation records exactly one event, so
+    /// blank lines are kept rather than splitting it up.
+    #[command(visible_alias = "a")]
     Add {
-        #[arg(trailing_var_arg = true)]
+        /// The text to record. Quoting is optional.
+        #[arg(trailing_var_arg = true, value_name = "TEXT")]
         text: Vec<String>,
     },
+
+    /// List recent entries, newest first.
+    #[command(visible_alias = "ls")]
     Log {
-        #[arg(short = 'n', default_value_t = 20)]
+        /// How many entries to show.
+        #[arg(short = 'n', default_value_t = 20, value_name = "COUNT")]
         number: usize,
     },
+
+    /// Show one entry in full.
+    ///
+    /// The id may be abbreviated to any unique prefix, like a git hash. An
+    /// ambiguous prefix lists the candidates rather than guessing.
     Show {
+        /// Event id, or a unique prefix of one.
+        #[arg(value_name = "ID")]
         id: String,
     },
+
+    /// Search the log with a regular expression.
+    ///
+    /// Matching is case-sensitive; prefix the pattern with `(?i)` to ignore
+    /// case. This searches the log, not the wiki — it finds what you wrote,
+    /// rather than what was derived from it.
+    #[command(visible_alias = "s")]
     Search {
+        /// Regular expression to match against entry text.
+        #[arg(value_name = "PATTERN")]
         query: String,
     },
+
+    /// Show how far the wiki lags the log, and what is not yet backed up.
+    ///
+    /// Reports the last build, how many entries are waiting to be folded, and
+    /// whether any entries exist only in the working tree. Uncommitted entries
+    /// survive a crash but not a lost machine, so a warning after 24 hours
+    /// suggests running `lw sync`.
     Status,
+
+    /// Commit and push the log without building the wiki.
+    ///
+    /// Cheap and model-free, so it is safe to run from cron. Use it to get
+    /// recent entries backed up off-machine between builds.
     Sync,
+
+    /// Check the log for damage.
+    ///
+    /// Verifies that every line in every month file parses as a valid entry.
+    /// A crash mid-write can leave a torn final line; that is the case this is
+    /// built to find. Reports problems without changing anything unless
+    /// --repair is given.
     Doctor {
+        /// Quarantine damaged lines instead of only reporting them.
+        ///
+        /// This is the only command besides `redact` that modifies the log, so
+        /// it is deliberately opt-in. Read the report first.
         #[arg(long)]
         repair: bool,
     },
+
+    /// Permanently erase the text of one entry.
+    ///
+    /// The documented exception to the log being append-only, for when a
+    /// password or someone else's secret gets pasted in. The entry's id and
+    /// timestamp remain, with the text replaced by a tombstone recording your
+    /// reason, so nothing that referenced it dangles.
+    ///
+    /// Note that git keeps the old text in history. To erase it there too you
+    /// will need `git filter-repo`; see docs/event-log.md.
     Redact {
+        /// Event id, or a unique prefix of one.
+        #[arg(value_name = "ID")]
         id: String,
-        #[arg(long)]
+        /// Why the text was erased. Recorded in place of the text.
+        #[arg(long, value_name = "REASON")]
         reason: String,
     },
-    /// Fold new log events into the wiki.
+
+    /// Fold new log entries into the wiki.
+    ///
+    /// Runs an agent that searches the wiki, reads whatever the new entries
+    /// might affect, and rewrites those pages. Its main job is reconciliation:
+    /// noticing that "I prefer apples now" contradicts a page saying oranges,
+    /// and fixing it rather than adding a second, contradictory page.
+    ///
+    /// Only entries added since the last build are folded. The wiki, the
+    /// cursor and the log move in a single commit, so `git revert` of that
+    /// commit undoes the whole build.
+    ///
+    /// Requires a clean wiki/, since a build rewrites pages and would
+    /// otherwise mix your edits into its own commit.
+    #[command(visible_alias = "b")]
     Build {
-        /// Write the wiki here instead of <home>/wiki, for comparing prompts.
+        /// Write the wiki here instead of <home>/wiki.
+        ///
+        /// Leaves the real wiki and the cursor untouched, so two prompt
+        /// versions can be built and compared with `diff -r`.
         #[arg(long, value_name = "DIR")]
         into: Option<PathBuf>,
-        /// Stop after this event id (inclusive).
+        /// Stop after this entry, so a run stays reproducible as the log grows.
         #[arg(long, value_name = "ID")]
         to: Option<String>,
-        /// Run the agent but discard the result and skip the commit.
+        /// Run the agent, then leave the changes uncommitted.
+        ///
+        /// Pages are still written to the working tree so you can inspect
+        /// them; discard with `git checkout -- wiki/`.
         #[arg(long)]
         dry_run: bool,
-        /// Maximum agent turns before the run fails.
-        #[arg(long, default_value_t = crate::reconcile::DEFAULT_MAX_TURNS)]
+        /// Give up after this many agent turns.
+        #[arg(long, default_value_t = crate::reconcile::DEFAULT_MAX_TURNS, value_name = "N")]
         max_turns: usize,
-        /// Use local, offline inference instead of the configured provider.
+        /// Run inference locally instead of using the configured provider.
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
-        /// Show the model's reasoning and full tool output.
+        /// Also show the model's reasoning and untruncated tool output.
         #[arg(short, long)]
         verbose: bool,
         /// Print only the final summary.
         #[arg(short, long, conflicts_with = "verbose")]
         quiet: bool,
     },
-    /// Rebuild the whole wiki from the log, discarding the current one.
+
+    /// Discard the wiki and derive it again from the whole log.
+    ///
+    /// Use this after improving the prompt: the log is the source of truth, so
+    /// the past can be re-derived. Every entry is folded again, which on a
+    /// hosted provider costs proportionally to your whole history.
+    ///
+    /// Prefer --into when iterating, so a bad run cannot touch the real wiki:
+    /// `lw rebuild --into /tmp/wiki-v2 && diff -r wiki /tmp/wiki-v2`.
+    #[command(visible_alias = "rb")]
     Rebuild {
+        /// Build into this directory instead, leaving the real wiki alone.
         #[arg(long, value_name = "DIR")]
         into: Option<PathBuf>,
+        /// Stop after this entry, so a run stays reproducible as the log grows.
         #[arg(long, value_name = "ID")]
         to: Option<String>,
-        #[arg(long, default_value_t = crate::reconcile::DEFAULT_MAX_TURNS)]
+        /// Give up after this many agent turns.
+        #[arg(long, default_value_t = crate::reconcile::DEFAULT_MAX_TURNS, value_name = "N")]
         max_turns: usize,
-        /// Required unless --into is given, since this discards the wiki.
+        /// Confirm discarding the current wiki. Required unless --into is given.
         #[arg(long)]
         force: bool,
-        /// Use local, offline inference instead of the configured provider.
+        /// Run inference locally instead of using the configured provider.
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
-        /// Show the model's reasoning and full tool output.
+        /// Also show the model's reasoning and untruncated tool output.
         #[arg(short, long)]
         verbose: bool,
         /// Print only the final summary.
@@ -424,5 +543,70 @@ fn verbosity(verbose: bool, quiet: bool) -> crate::progress::Verbosity {
         (true, _) => Verbosity::Verbose,
         (_, true) => Verbosity::Quiet,
         _ => Verbosity::Normal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Help text is documentation, and documentation that only exists in one
+    /// place goes stale silently. This at least enforces that it exists.
+    #[test]
+    fn every_command_and_argument_is_documented() {
+        let command = Cli::command();
+        for subcommand in command.get_subcommands() {
+            let name = subcommand.get_name();
+            if name == "help" {
+                continue;
+            }
+            assert!(
+                subcommand.get_about().is_some(),
+                "`lw {name}` has no help text"
+            );
+            for argument in subcommand.get_arguments() {
+                let id = argument.get_id();
+                if id == "help" {
+                    continue;
+                }
+                assert!(
+                    argument.get_help().is_some(),
+                    "`lw {name} --{id}` has no help text"
+                );
+            }
+        }
+    }
+
+    /// The top-level `--help` is the first thing a new user reads.
+    #[test]
+    fn the_binary_explains_itself() {
+        let command = Cli::command();
+        assert!(command.get_about().is_some());
+        let long = command
+            .get_long_about()
+            .expect("no long_about")
+            .to_string();
+        // The two facts that make the design comprehensible.
+        assert!(long.contains("append-only"), "{long}");
+        assert!(long.contains("rebuilt from the log"), "{long}");
+    }
+
+    #[test]
+    fn destructive_commands_say_so() {
+        let command = Cli::command();
+        let rebuild = command
+            .get_subcommands()
+            .find(|c| c.get_name() == "rebuild")
+            .expect("no rebuild command");
+        let text = format!(
+            "{} {}",
+            rebuild.get_about().unwrap(),
+            rebuild.get_long_about().map(|s| s.to_string()).unwrap_or_default()
+        );
+        assert!(
+            text.contains("Discard") || text.contains("discard"),
+            "rebuild's help should warn that it discards the wiki: {text}"
+        );
     }
 }
