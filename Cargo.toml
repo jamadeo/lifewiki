@@ -29,7 +29,7 @@ toml = "0.8"
 ulid = "1.1"
 
 [features]
-default = []
+default = ["local"]
 # Local, offline inference via llama.cpp. Compiles llama.cpp from source, so
 # it is off by default; see docs/pipeline.md.
 local = ["dep:goose-local-inference"]
