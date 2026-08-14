@@ -223,7 +223,7 @@ pub enum Task {
 }
 
 impl Task {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Task::Build => "build",
             Task::Ask => "ask",
@@ -346,8 +346,10 @@ impl ModelSettings {
             .with_context(|| format!("could not read {}", path.display()))?;
         let parsed: ConfigFile = toml::from_str(&raw).with_context(|| {
             format!(
-                "{} is not valid TOML (or has an unknown key under [model])",
-                path.display()
+                "{} is not valid TOML (or has an unknown key under [model]); \
+                 needed to resolve the model for `lw {}`",
+                path.display(),
+                task.name()
             )
         })?;
         Ok(parsed.model.resolve(task))
