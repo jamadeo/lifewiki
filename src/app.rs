@@ -384,14 +384,28 @@ fn init(home: &Path) -> Result<()> {
             home.join("config.toml"),
             concat!(
                 "# lifewiki configuration\n",
-                "# pending_warning_hours = 24\n\n",
+                "# pending_warning_hours = 24\n",
+                "\n",
+                "# Model settings. [model] applies to everything; the sub-tables\n",
+                "# override it per task. Reconciliation rewrites files over a long\n",
+                "# run and rewards a stronger model; answering is short, frequent\n",
+                "# and read-only, so it is the place to spend less.\n",
+                "#\n",
+                "# provider: anthropic | local | none\n",
+                "#   `local` runs offline and needs a binary built with\n",
+                "#   --features local (or metal/cuda/vulkan).\n",
+                "# name: omit to use the provider's own default.\n",
+                "\n",
                 "[model]\n",
-                "# anthropic | local | none\n",
-                "# `local` runs entirely offline and requires a binary built\n",
-                "# with --features local (or metal/cuda/vulkan).\n",
                 "provider = \"anthropic\"\n",
                 "name = \"claude-sonnet-4-5\"\n",
                 "timeout_seconds = 120\n",
+                "\n",
+                "# [model.build]\n",
+                "# name = \"claude-opus-5\"\n",
+                "\n",
+                "# [model.ask]\n",
+                "# provider = \"local\"\n",
             ),
         )?;
     }
@@ -513,6 +527,7 @@ fn status(home: &Path) -> Result<()> {
     if crate::git::is_dirty(home, "wiki")? {
         println!("wiki/ has uncommitted changes; `lw build` will refuse to run");
     }
+    show_models(home)?;
     Ok(())
 }
 
@@ -574,6 +589,21 @@ fn run_build(home: &Path, options: crate::build::Options) -> Result<()> {
     Ok(())
 }
 
+/// Report which model each task will use. Per-task config is exactly the kind
+/// of thing that silently does nothing when mistyped, so make it inspectable.
+fn show_models(home: &Path) -> Result<()> {
+    use crate::model::{ModelSettings, Task};
+    let build = ModelSettings::load(home, Task::Build)?;
+    let ask = ModelSettings::load(home, Task::Ask)?;
+    if build == ask {
+        println!("Model: {}", build.describe());
+    } else {
+        println!("Model (build): {}", build.describe());
+        println!("Model (ask):   {}", ask.describe());
+    }
+    Ok(())
+}
+
 fn ask(
     home: &Path,
     question: Vec<String>,
@@ -602,7 +632,7 @@ fn ask(
         );
     }
 
-    let mut settings = crate::model::ModelSettings::load(home)?;
+    let mut settings = crate::model::ModelSettings::load(home, crate::model::Task::Ask)?;
     if let Some(provider) = &provider_override {
         settings = settings.with_provider(provider);
     }

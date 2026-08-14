@@ -159,6 +159,40 @@ Reconciliation asks a lot of a small model: many turns, well-formed tool calls
 throughout. Pages record which model wrote them (`generated.by:
 lifewiki/local-…`), so mixed-provenance wikis stay auditable.
 
+## Configuring models
+
+`[model]` applies to everything; per-task sub-tables override it. The tasks
+differ: reconciliation rewrites files over a long run and rewards a stronger
+model, while answering is short, frequent and read-only.
+
+```toml
+[model]
+provider = "anthropic"        # anthropic | local | none
+name = "claude-sonnet-4-5"
+timeout_seconds = 120
+
+[model.build]
+name = "claude-opus-5"        # spend more where files get rewritten
+
+[model.ask]
+provider = "local"            # questions never leave the machine
+```
+
+A `name` is inherited only when the task keeps the same provider — a model name
+means nothing to a provider it wasn't written for. To pin a local model, set
+`name` inside `[model.ask]` alongside `provider`.
+
+`lw status` prints what each task resolved to, so a mistyped table is obvious
+without spending a model call:
+
+```
+$ lw status
+Model (build): anthropic/claude-opus-5
+Model (ask):   local (default model)
+```
+
+`--local` on either command overrides the config for that run.
+
 ## What's stored
 
 ```

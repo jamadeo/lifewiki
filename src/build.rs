@@ -88,7 +88,7 @@ pub struct Report {
 }
 
 pub fn build(home: &Path, options: Options) -> Result<Report> {
-    let mut settings = model::ModelSettings::load(home)?;
+    let mut settings = model::ModelSettings::load(home, model::Task::Build)?;
     if let Some(provider) = &options.provider_override {
         settings = settings.with_provider(provider);
     }
