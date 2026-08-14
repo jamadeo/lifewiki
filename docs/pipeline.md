@@ -14,50 +14,50 @@ a contradiction exists at all.
 Decomposed, that is five problems. Each is genuinely open; none is solved by our
 format choices so far.
 
-### P1. Retrieval — which pages might this event touch?
-The model can't see the whole wiki (context limits, and it grows without bound),
-so something must select candidate pages *before* generation. This is the problem
-that most determines output quality: **a page that isn't retrieved cannot be
-reconciled**, and the failure is silent — the wiki keeps quietly asserting the old
-fact.
+### P1+P2. Retrieval and reconciliation are one problem (S24)
 
-Hard because the event's wording need not share vocabulary with the page
-("apples" vs. a page titled `preferences.md`), and because the *absence* of a
-relevant page is a legitimate answer (create a new one).
+The original plan separated these: retrieve candidate pages, then ask the model
+to rewrite them. That was wrong, and the reason is worth keeping.
 
-Approaches, cheapest first:
+Retrieval has to decide what is relevant *before* the model has read anything.
+But relevance is often only knowable after reading: a page titled
+`preferences.md` may or may not mention fruit, and the only way to find out is to
+open it. Worse, one read suggests the next — an event about Ada leads to her
+page, which mentions a trip, whose page also needs updating. A one-shot retriever
+must guess all of that up front; the failure is silent, and the wiki keeps
+asserting a stale fact.
 
-1. **Literal search** over page text and titles for salient nouns from the event.
-   Free, deterministic, no model. Misses paraphrase.
-2. **Index-based routing**: feed the model `index.md` (titles + descriptions
-   only — cheap) and let it name candidate pages. Handles paraphrase, costs one
-   model call, and is why OKF's `index.md` is worth generating (S21).
-3. **Embeddings** over pages/sections. Best recall, but adds a model dependency,
-   a vector store, and a rebuild cost. Explicitly deferred until 1+2 are shown
-   insufficient.
+So reconciliation is an **agent loop**. The agent gets tools and decides how to
+use them:
 
-Start with 1+2 combined: literal search proposes, the model's view of the index
-adds what literal search missed.
+| tool | purpose |
+|------|---------|
+| `list_pages` | see what exists |
+| `search_wiki` | case-insensitive literal search; the main way to find contradictions |
+| `read_page` | read a page in full, including frontmatter |
+| `write_page` | create or overwrite; validated before it touches disk |
+| `delete_page` | rare; prefer rewriting |
+| `finish` | done, with a summary |
 
-### P2. Reconciliation — what should change, and how?
-Given the event plus candidate pages, decide per claim: leave alone, amend,
-delete, or add. Includes the judgement S6 assigned to the model — whether the old
-value should be **erased** ("that was never true") or **kept as dated history**
-("was true, isn't now").
+The system prompt does the work that structure can't: it states that
+reconciliation is the point, that a stale fact left behind is the worst outcome,
+that searching several times and finding nothing is cheap, and that the
+erase-vs-keep-history decision follows from the page `type`.
 
-That judgement can't be made per-event in isolation; it depends on the *kind of
-fact*. So it belongs in page conventions, expressed via `type`:
+Safety properties (S25, S26):
 
-| `type` | supersession policy |
-|--------|--------------------|
-| `Person`, `Place`, `Project` | current state; corrections erase |
-| `Opinion`, `Preference` | keep dated history — how views changed is the point |
-| `Habit` | keep dated history |
-| `Journal` | append-only; never rewritten (it's a record of a day) |
-| `Todo` | current state; completion moves the item |
+- **Bounded**: default 24 turns, then the run fails loudly. An agent with write
+  access that can loop forever burns money and corrupts pages.
+- **Validated**: `write_page` runs OKF conformance first, so a mangled document
+  becomes a tool error the agent can fix on the next turn, never a broken file.
+- **Scoped**: tools resolve paths against `wiki/` and reject traversal. The log
+  is not reachable at all — the agent is handed the events it must fold.
+- **Errors are returned, not raised**: a bad path or invalid page comes back as
+  tool output, because the agent can correct those itself.
 
-Encoding this per-type rather than per-event is what makes the model's behaviour
-consistent enough to be predictable.
+Note what this does *not* solve: the agent can still fail to search for the right
+thing. Bounding turns and validating writes protects the wiki's integrity, not
+its accuracy. Accuracy is a prompt-quality problem, measured by S20's diffs.
 
 ### P3. Application — how do edits reach disk safely?
 The model returns **whole-file content** per page (simpler and more reliable than
@@ -120,9 +120,11 @@ No tools and no multi-turn state, because reconciliation is a pure function of
    through the same crate, so "run this entirely locally" — which matters when the
    input is your whole life — is a config change, not a rewrite.
 
-`goose-agent` is *not* used here (S23). It's a tool-using state machine, which the
-pipeline doesn't need; it's the right tool for the phase 3 `lw ask` agent, which
-does.
+`goose-agent`'s state machine is not used: it is built around persisted chat
+sessions (`SessionLoader`, `Conversation`, `EffectHandler`), while our loop is
+synchronous, single-session and short-lived. We drive `Provider` directly and
+keep the loop in `src/reconcile.rs`, which is ~100 lines. Its tool types come
+from `rmcp`, the same version goose uses.
 
 Configuration lives in `config.toml`:
 
@@ -153,13 +155,16 @@ traced to the exact pipeline that wrote it.
    (if dumb) wiki.
 2. **Retrieval, still no model.** Literal search over the wiki returning candidate
    pages, with a `lw retrieve <text>` debug command to inspect it directly.
-3. **Model reconciliation.** Single-page case first: one event, one candidate
-   page, whole-file rewrite, strict validation.
-4. **Multi-page batches**, `index.md` regeneration, `unresolved.md`.
+3. **The agent loop.** ✅ Implemented in `src/reconcile.rs`, with tools in
+   `src/tools.rs` and the OKF write gate in `src/okf.rs`. Tested against a
+   scripted model, so the loop, the turn limit, and the
+   invalid-write-is-refused path are all covered without an API key.
+4. **`lw build`**: batching, cursor, atomic commit, run logs.
 5. **`lw rebuild`** over the test corpus; start diffing prompt versions (S20).
 
-Step 1 is the one that de-risks the rest: everything except the model call gets
-exercised and tested before nondeterminism enters.
+Steps 1 and 2 are subsumed: with tools, the agent does its own retrieval, and the
+deterministic skeleton is now the `lw build` command around the loop rather than
+a stand-in for it.
 
 ## Open questions
 

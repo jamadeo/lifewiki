@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use goose_providers::anthropic::{AnthropicProviderBuilder, ANTHROPIC_API_VERSION};
 use goose_providers::api_client::{ApiClient, AuthMethod};
 use goose_providers::base::Provider;
-use goose_providers::conversation::message::Message;
+use goose_providers::conversation::message::{Message, MessageContent};
 use goose_providers::model::ModelConfig;
 use std::time::Duration;
 
@@ -34,10 +34,72 @@ pub struct Response {
     pub usage: Usage,
 }
 
+/// A tool call the model wants to make.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// One turn of an agent loop: whatever the model said, plus any tool calls.
+#[derive(Debug, Default)]
+pub struct Turn {
+    pub text: String,
+    pub calls: Vec<ToolCall>,
+    pub usage: Usage,
+}
+
 pub trait Model: Send + Sync {
     /// Actor string for OKF `generated.by`, e.g. `lifewiki/claude-sonnet-4-5`.
     fn actor(&self) -> String;
+
+    /// Single-shot completion, no tools.
     fn complete(&self, request: Request) -> Result<Response>;
+
+    /// One turn of a tool-using conversation. `history` is the running
+    /// transcript; the implementation appends the assistant reply to it so the
+    /// caller can add tool responses and call again.
+    fn turn(
+        &self,
+        _system: &str,
+        _history: &mut Conversation,
+        _tools: &[rmcp::model::Tool],
+    ) -> Result<Turn> {
+        bail!("this model does not support tool use")
+    }
+}
+
+/// The running transcript of an agent loop. Wraps the provider message type so
+/// the pipeline never imports provider types directly.
+#[derive(Default)]
+pub struct Conversation {
+    messages: Vec<Message>,
+}
+
+impl Conversation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_user(&mut self, text: impl Into<String>) {
+        self.messages.push(Message::user().with_text(text));
+    }
+
+    /// Record the result of a tool call, keyed to the request id.
+    pub fn push_tool_result(&mut self, call_id: &str, output: &str, is_error: bool) {
+        let result = if is_error {
+            rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(output)])
+        } else {
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(output)])
+        };
+        self.messages
+            .push(Message::user().with_tool_response(call_id, Ok(result)));
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
 }
 
 /// A model that refuses to run. Used by the deterministic pipeline steps so
@@ -119,6 +181,49 @@ impl Model for AnthropicModel {
                 output_tokens: usage.usage.output_tokens,
             },
         })
+    }
+
+    fn turn(
+        &self,
+        system: &str,
+        history: &mut Conversation,
+        tools: &[rmcp::model::Tool],
+    ) -> Result<Turn> {
+        let (reply, usage) = self
+            .runtime
+            .block_on(async {
+                self.provider
+                    .complete(&self.config, system, &history.messages, tools)
+                    .await
+            })
+            .context("model request failed")?;
+
+        let mut turn = Turn {
+            text: reply.as_concat_text(),
+            usage: Usage {
+                input_tokens: usage.usage.input_tokens,
+                output_tokens: usage.usage.output_tokens,
+            },
+            ..Turn::default()
+        };
+        for content in &reply.content {
+            if let MessageContent::ToolRequest(request) = content {
+                match &request.tool_call {
+                    Ok(call) => turn.calls.push(ToolCall {
+                        id: request.id.clone(),
+                        name: call.name.to_string(),
+                        arguments: call
+                            .arguments
+                            .clone()
+                            .map(serde_json::Value::Object)
+                            .unwrap_or(serde_json::Value::Null),
+                    }),
+                    Err(error) => bail!("model produced an invalid tool call: {error}"),
+                }
+            }
+        }
+        history.messages.push(reply);
+        Ok(turn)
     }
 }
 

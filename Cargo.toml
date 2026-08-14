@@ -17,8 +17,10 @@ goose-agent = "0.1.0-alpha.6"
 goose-providers = "0.1.0-alpha.6"
 libc = "0.2"
 regex = "1.11"
+rmcp = "3.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["rt", "time"] }
 toml = "0.8"
 ulid = "1.1"
