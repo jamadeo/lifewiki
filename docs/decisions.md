@@ -29,6 +29,14 @@ All phase-1 decisions are settled. Newer decisions are appended as they're made.
 |---|-------|------|
 | ~~D7~~ | Model provider | **Resolved**: `goose-agent` + `goose-providers` `0.1.0-alpha.6`. See S22 |
 
+| # | Decision | Rationale |
+|---|----------|-----------|
+| S27 | `lw build` batches **all** events since the cursor, uncapped (resolves D12) | events written in one sitting usually concern one topic, and the agent reconciles them better together than in isolation. A cap would split related events across runs arbitrarily. Revisit if a long gap produces an unmanageable batch |
+| S28 | One commit covers `wiki/`, `state/cursor.json` and `log/` together | the repo must never record a wiki claiming to reflect events it hasn't seen. Also means `git revert` of a build undoes it completely, and folded events get committed (and so backed up) as a side effect |
+| S29 | The cursor advances only after a successful agent run | a failed or interrupted build leaves a dirty tree that `git checkout -- wiki/` discards, and the next build retries the same events. Crash-safety without a journal |
+| S30 | `lw build` refuses to run on a dirty `wiki/` | otherwise a build would mix hand-edits into its own commit, or destroy them. Forces the D11 question to be answered deliberately rather than by accident |
+| S31 | Run logs are written even when the agent fails | a failed run is exactly when the transcript is most useful |
+
 ## Open (phase 2, raised by S21)
 
 ### D10. How many `sources` does a page keep?

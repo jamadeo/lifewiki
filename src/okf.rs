@@ -24,12 +24,14 @@ impl Page {
             .and_then(|value| value.as_str())
     }
 
+    #[allow(dead_code)] // for index.md generation
     pub fn description(&self) -> Option<&str> {
         self.frontmatter
             .get(serde_yaml::Value::from("description"))
             .and_then(|value| value.as_str())
     }
 
+    #[allow(dead_code)] // for index.md generation
     pub fn title(&self) -> Option<&str> {
         self.frontmatter
             .get(serde_yaml::Value::from("title"))

@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use std::{
     env, fs,
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -41,6 +41,33 @@ enum CommandName {
         id: String,
         #[arg(long)]
         reason: String,
+    },
+    /// Fold new log events into the wiki.
+    Build {
+        /// Write the wiki here instead of <home>/wiki, for comparing prompts.
+        #[arg(long, value_name = "DIR")]
+        into: Option<PathBuf>,
+        /// Stop after this event id (inclusive).
+        #[arg(long, value_name = "ID")]
+        to: Option<String>,
+        /// Run the agent but discard the result and skip the commit.
+        #[arg(long)]
+        dry_run: bool,
+        /// Maximum agent turns before the run fails.
+        #[arg(long, default_value_t = crate::reconcile::DEFAULT_MAX_TURNS)]
+        max_turns: usize,
+    },
+    /// Rebuild the whole wiki from the log, discarding the current one.
+    Rebuild {
+        #[arg(long, value_name = "DIR")]
+        into: Option<PathBuf>,
+        #[arg(long, value_name = "ID")]
+        to: Option<String>,
+        #[arg(long, default_value_t = crate::reconcile::DEFAULT_MAX_TURNS)]
+        max_turns: usize,
+        /// Required unless --into is given, since this discards the wiki.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -102,6 +129,48 @@ pub fn run() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        CommandName::Build {
+            into,
+            to,
+            dry_run,
+            max_turns,
+        } => {
+            paths::require_initialized(&home)?;
+            run_build(
+                &home,
+                crate::build::Options {
+                    into,
+                    to,
+                    rebuild: false,
+                    dry_run,
+                    max_turns,
+                },
+            )
+        }
+        CommandName::Rebuild {
+            into,
+            to,
+            max_turns,
+            force,
+        } => {
+            paths::require_initialized(&home)?;
+            if into.is_none() && !force {
+                bail!(
+                    "rebuild discards the current wiki and re-derives it from the log.\n\
+                     Re-run with --force, or use --into <dir> to build a copy elsewhere."
+                );
+            }
+            run_build(
+                &home,
+                crate::build::Options {
+                    into,
+                    to,
+                    rebuild: true,
+                    dry_run: false,
+                    max_turns,
+                },
+            )
         }
         CommandName::Redact { id, reason } => {
             paths::require_initialized(&home)?;
@@ -187,23 +256,50 @@ fn git(home: &Path, args: &[&str]) -> Result<()> {
 }
 fn status(home: &Path) -> Result<()> {
     paths::require_initialized(home)?;
-    let output = Command::new("git")
-        .args(["status", "--porcelain", "--", "log"])
-        .current_dir(home)
-        .output()?;
-    let dirty = !output.stdout.is_empty();
-    let count = if dirty {
-        Log::open(home)?.events()?.len()
-    } else {
-        0
+    let log = Log::open(home)?;
+    let cursor = crate::build::Cursor::load(home)?;
+
+    let unfolded = match &cursor.last_event {
+        Some(id) => log.since(id)?,
+        None => log.events()?,
     };
+    match &cursor.built_at {
+        Some(at) => println!("Last build: {at}"),
+        None => println!("Last build: never"),
+    }
     println!(
-        "{} pending event{}",
-        count,
-        if count == 1 { "" } else { "s" }
+        "{} event{} not yet folded into the wiki",
+        unfolded.len(),
+        if unfolded.len() == 1 { "" } else { "s" }
     );
+
+    // Uncommitted log events exist only in the working tree, so they are not
+    // backed up by a push (S12).
+    let uncommitted = crate::git::capture(home, &["status", "--porcelain", "--", "log"])?;
+    if !uncommitted.trim().is_empty() {
+        let pending = log.events()?;
+        let oldest = pending
+            .iter()
+            .rev()
+            .filter_map(|event| chrono::DateTime::parse_from_rfc3339(&event.ts).ok())
+            .last();
+        print!("Log has uncommitted events");
+        if let Some(oldest) = oldest {
+            let age = chrono::Local::now().signed_duration_since(oldest);
+            print!(" (oldest {} hours old)", age.num_hours());
+            if age.num_hours() >= 24 {
+                print!(" — run `lw sync` to back them up");
+            }
+        }
+        println!();
+    }
+
+    if crate::git::is_dirty(home, "wiki")? {
+        println!("wiki/ has uncommitted changes; `lw build` will refuse to run");
+    }
     Ok(())
 }
+
 fn sync(home: &Path) -> Result<()> {
     paths::require_initialized(home)?;
     let status = Command::new("git")
@@ -221,5 +317,43 @@ fn sync(home: &Path) -> Result<()> {
         bail!("events were committed, but git push failed");
     }
     println!("Synced pending log events.");
+    Ok(())
+}
+
+fn run_build(home: &Path, options: crate::build::Options) -> Result<()> {
+    let dry_run = options.dry_run;
+    let report = crate::build::build(home, options)?;
+
+    if report.events == 0 {
+        println!("Nothing to build; the wiki is up to date.");
+        return Ok(());
+    }
+
+    if let Some(outcome) = &report.outcome {
+        println!(
+            "Folded {} event{} in {} turn{}.",
+            report.events,
+            if report.events == 1 { "" } else { "s" },
+            outcome.turns,
+            if outcome.turns == 1 { "" } else { "s" }
+        );
+        if !outcome.journal.writes.is_empty() {
+            for page in &outcome.journal.writes {
+                println!("  {page}");
+            }
+        }
+        if !outcome.summary.is_empty() {
+            println!("\n{}", outcome.summary);
+        }
+    }
+    if let Some(dir) = &report.run_dir {
+        println!("\nRun log: {}", dir.display());
+    }
+    if dry_run {
+        println!("\nDry run: changes were written to the working tree but not committed.");
+        println!("Discard them with `git -C {} checkout -- wiki/`", home.display());
+    } else if !report.committed {
+        println!("\nNot committed.");
+    }
     Ok(())
 }

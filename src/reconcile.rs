@@ -45,11 +45,10 @@ impl<'a> Reconciler<'a> {
         }
         let definitions = tools::definitions();
         let mut conversation = Conversation::new();
-        conversation.push_user(kickoff(events));
+        conversation.push_user(kickoff(events, &self.model.actor(), &now()));
 
         let mut transcript = Vec::new();
         let mut usage = Usage::default();
-        let mut summary = String::new();
 
         for turn_number in 1..=self.max_turns {
             let turn = self.model.turn(SYSTEM, &mut conversation, &definitions)?;
@@ -62,9 +61,8 @@ impl<'a> Reconciler<'a> {
             if turn.calls.is_empty() {
                 // No tool calls and no explicit finish: treat the text as the
                 // summary and stop, rather than prompting in a loop.
-                summary = turn.text.trim().to_string();
                 return Ok(Outcome {
-                    summary,
+                    summary: turn.text.trim().to_string(),
                     turns: turn_number,
                     usage,
                     journal: workspace.journal.clone(),
@@ -74,7 +72,7 @@ impl<'a> Reconciler<'a> {
 
             for call in &turn.calls {
                 if call.name == "finish" {
-                    summary = call
+                    let summary = call
                         .arguments
                         .get("summary")
                         .and_then(|value| value.as_str())
@@ -208,9 +206,17 @@ Guessing wrong silently is worse than admitting you could not tell.
 When the wiki fully reflects the events, call `finish` with a short summary of
 what you changed and why."#;
 
-fn kickoff(events: &[Event]) -> String {
-    let mut text =
-        String::from("Fold these new log events into the wiki. Search before you write.\n\n");
+fn now() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn kickoff(events: &[Event], actor: &str, timestamp: &str) -> String {
+    let mut text = format!(
+        "Fold these new log events into the wiki. Search before you write.\n\n\
+         When you write or rewrite a page, set its frontmatter `generated` to:\n\
+         generated: {{ by: {actor}, at: {timestamp} }}\n\n\
+         New events:\n\n"
+    );
     for event in events {
         text.push_str(&format!(
             "- id: {}\n  recorded: {}\n  footnote label: e{}\n  text: {:?}\n",
@@ -226,7 +232,7 @@ fn kickoff(events: &[Event]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Request, Response, ToolCall, Turn};
+    use crate::model::{ToolCall, Turn};
     use std::cell::RefCell;
     use std::sync::Mutex;
 
@@ -246,9 +252,6 @@ mod tests {
     impl Model for ScriptedModel {
         fn actor(&self) -> String {
             "lifewiki/test".into()
-        }
-        fn complete(&self, _request: Request) -> Result<Response> {
-            unimplemented!()
         }
         fn turn(
             &self,

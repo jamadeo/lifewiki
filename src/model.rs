@@ -13,25 +13,11 @@ use goose_providers::conversation::message::{Message, MessageContent};
 use goose_providers::model::ModelConfig;
 use std::time::Duration;
 
-/// One completion request. Deliberately minimal: the pipeline sends a system
-/// prompt plus a single user turn and expects text back. No tools, no
-/// multi-turn state — reconciliation is a pure function of (event, pages).
-pub struct Request {
-    pub system: String,
-    pub user: String,
-}
-
 /// What a model call cost, for run logs.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Usage {
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
-}
-
-#[derive(Debug)]
-pub struct Response {
-    pub text: String,
-    pub usage: Usage,
 }
 
 /// A tool call the model wants to make.
@@ -54,20 +40,15 @@ pub trait Model: Send + Sync {
     /// Actor string for OKF `generated.by`, e.g. `lifewiki/claude-sonnet-4-5`.
     fn actor(&self) -> String;
 
-    /// Single-shot completion, no tools.
-    fn complete(&self, request: Request) -> Result<Response>;
-
     /// One turn of a tool-using conversation. `history` is the running
     /// transcript; the implementation appends the assistant reply to it so the
     /// caller can add tool responses and call again.
     fn turn(
         &self,
-        _system: &str,
-        _history: &mut Conversation,
-        _tools: &[rmcp::model::Tool],
-    ) -> Result<Turn> {
-        bail!("this model does not support tool use")
-    }
+        system: &str,
+        history: &mut Conversation,
+        tools: &[rmcp::model::Tool],
+    ) -> Result<Turn>;
 }
 
 /// The running transcript of an agent loop. Wraps the provider message type so
@@ -97,6 +78,7 @@ impl Conversation {
             .push(Message::user().with_tool_response(call_id, Ok(result)));
     }
 
+    #[allow(dead_code)] // used by run logging once transcripts include turn counts
     pub fn len(&self) -> usize {
         self.messages.len()
     }
@@ -110,8 +92,16 @@ impl Model for StubModel {
     fn actor(&self) -> String {
         "lifewiki/deterministic".to_string()
     }
-    fn complete(&self, _request: Request) -> Result<Response> {
-        bail!("this operation requires a model; configure one in config.toml")
+    fn turn(
+        &self,
+        _system: &str,
+        _history: &mut Conversation,
+        _tools: &[rmcp::model::Tool],
+    ) -> Result<Turn> {
+        bail!(
+            "no model is configured, so the wiki cannot be built.\n\
+             Set [model] provider = \"anthropic\" in config.toml and export ANTHROPIC_API_KEY."
+        )
     }
 }
 
@@ -126,7 +116,12 @@ pub struct AnthropicModel {
 impl AnthropicModel {
     pub fn new(model_name: &str, timeout: Duration) -> Result<Self> {
         let key = std::env::var("ANTHROPIC_API_KEY")
-            .context("ANTHROPIC_API_KEY is not set; export it or use a local provider")?;
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .context(
+                "ANTHROPIC_API_KEY is not set (or is empty).\n\
+                 Export it, or set provider = \"none\" in config.toml to disable model use.",
+            )?;
         let api_client = ApiClient::with_timeout_and_tls(
             "https://api.anthropic.com".to_string(),
             AuthMethod::ApiKey {
@@ -157,30 +152,6 @@ impl AnthropicModel {
 impl Model for AnthropicModel {
     fn actor(&self) -> String {
         format!("lifewiki/{}", self.model_name.replace('.', "-"))
-    }
-
-    fn complete(&self, request: Request) -> Result<Response> {
-        let message = Message::user().with_text(request.user);
-        let (reply, usage) = self
-            .runtime
-            .block_on(async {
-                self.provider
-                    .complete(&self.config, &request.system, &[message], &[])
-                    .await
-            })
-            .context("model request failed")?;
-
-        let text = reply.as_concat_text();
-        if text.trim().is_empty() {
-            bail!("model returned an empty response");
-        }
-        Ok(Response {
-            text,
-            usage: Usage {
-                input_tokens: usage.usage.input_tokens,
-                output_tokens: usage.usage.output_tokens,
-            },
-        })
     }
 
     fn turn(
@@ -297,13 +268,11 @@ mod tests {
     #[test]
     fn stub_refuses_and_says_why() {
         let error = StubModel
-            .complete(Request {
-                system: "s".into(),
-                user: "u".into(),
-            })
+            .turn("s", &mut Conversation::new(), &[])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("requires a model"), "{error}");
+        assert!(error.contains("no model is configured"), "{error}");
+        assert!(error.contains("config.toml"), "{error}");
     }
 
     #[test]
@@ -317,14 +286,13 @@ mod tests {
     #[ignore]
     fn anthropic_round_trip() {
         let model = AnthropicModel::new("claude-sonnet-4-5", Duration::from_secs(60)).unwrap();
-        let response = model
-            .complete(Request {
-                system: "Reply with exactly one word.".into(),
-                user: "Say the word: apples".into(),
-            })
+        let mut history = Conversation::new();
+        history.push_user("Say the word: apples");
+        let turn = model
+            .turn("Reply with exactly one word.", &mut history, &[])
             .unwrap();
-        println!("actor={} text={:?}", model.actor(), response.text);
-        println!("usage={:?}", response.usage);
-        assert!(response.text.to_lowercase().contains("apples"));
+        println!("actor={} text={:?}", model.actor(), turn.text);
+        println!("usage={:?}", turn.usage);
+        assert!(turn.text.to_lowercase().contains("apples"));
     }
 }

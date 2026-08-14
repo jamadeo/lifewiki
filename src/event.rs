@@ -22,6 +22,7 @@ impl Event {
 
     /// The event's text, or a placeholder if it was redacted. Callers that must
     /// distinguish the two should check `is_redacted` first.
+    #[allow(dead_code)]
     pub fn text(&self) -> &str {
         self.text.as_deref().unwrap_or("[redacted]")
     }

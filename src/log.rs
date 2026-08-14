@@ -93,6 +93,7 @@ impl Log {
             .filter(|e| e.id.as_str() > id)
             .collect())
     }
+    #[allow(dead_code)] // build --to uses retain(); kept for the phase 3 agent
     pub fn upto(&self, id: &str) -> Result<Vec<Event>> {
         Ok(self
             .events()?

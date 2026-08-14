@@ -159,7 +159,8 @@ traced to the exact pipeline that wrote it.
    `src/tools.rs` and the OKF write gate in `src/okf.rs`. Tested against a
    scripted model, so the loop, the turn limit, and the
    invalid-write-is-refused path are all covered without an API key.
-4. **`lw build`**: batching, cursor, atomic commit, run logs.
+4. **`lw build`**: batching, cursor, atomic commit, run logs. ✅ Implemented in
+   `src/build.rs`.
 5. **`lw rebuild`** over the test corpus; start diffing prompt versions (S20).
 
 Steps 1 and 2 are subsumed: with tools, the agent does its own retrieval, and the
@@ -168,10 +169,9 @@ a stand-in for it.
 
 ## Open questions
 
-- **D12. Batch granularity.** One model call per event (simple, expensive, misses
-  that two events in one sitting often concern one topic) or per batch (cheaper,
-  more context, but a single bad response can corrupt several pages)? Leaning
-  per-batch with a small cap.
+- ~~**D12. Batch granularity.**~~ Resolved (S27): all events since the cursor,
+  uncapped. Events from one sitting usually concern one topic and reconcile
+  better together.
 - **D13. Journal pages at all?** A per-day append-only page is cheap and gives
   narrative texture, but it duplicates the log. Is a journal page a *view* of the
   log (regenerable, deterministic, no model) rather than something the model

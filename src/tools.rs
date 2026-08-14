@@ -397,13 +397,19 @@ pub mod tests {
         pub struct Dir(PathBuf);
         impl Dir {
             pub fn new() -> Self {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static COUNTER: AtomicU64 = AtomicU64::new(0);
+                // Include a process-wide counter: two tests running in
+                // parallel can otherwise land on the same nanosecond, and the
+                // first to finish deletes the other's directory.
                 let path = std::env::temp_dir().join(format!(
-                    "lifewiki-test-{}-{:?}",
+                    "lifewiki-test-{}-{}-{}",
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
-                        .as_nanos()
+                        .as_nanos(),
+                    COUNTER.fetch_add(1, Ordering::Relaxed)
                 ));
                 std::fs::create_dir_all(&path).unwrap();
                 Self(path)

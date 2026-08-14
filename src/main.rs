@@ -1,4 +1,6 @@
 mod app;
+mod build;
+mod git;
 mod model;
 mod okf;
 mod reconcile;
