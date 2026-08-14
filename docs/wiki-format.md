@@ -130,3 +130,39 @@ because it changes what the pipeline emits and gives `lw doctor` a second job
 (validating wiki conformance alongside log integrity). One incidental
 confirmation: citing events as `/log/YYYY-MM.jsonl#<id>` only works because log
 and wiki share a repo (S7), so that choice pays off in an unplanned way.
+
+
+## Viewing the wiki
+
+Because a bundle is just markdown with YAML frontmatter, existing tools work
+without conversion. Obsidian can open `wiki/` as a vault directly.
+
+Two things do not render the way you might expect, and both are inherent to the
+format rather than bugs in the wiki:
+
+**Footnote citations.** OKF attributes claims with markdown footnotes keyed to
+`sources` ids (SPEC §5.1), e.g. `[^eS8MYJB4MVV]`. Footnotes are a *CommonMark
+extension*, so support varies:
+
+- Obsidian renders them in Reading view but shows the raw `[^label]` in Live
+  Preview / Source mode. Nothing is broken — it is the editing view.
+- The footnote *text* deliberately duplicates the event text, while the
+  authoritative pointer is the `resource` field in frontmatter, which no
+  markdown renderer resolves. Provenance is therefore only fully visible by
+  reading the frontmatter, or via `lw show <event-id>`.
+- Labels must be unique per event. See the note on ULID prefixes below.
+
+**Links.** OKF uses standard markdown links with bundle-absolute paths,
+`[Ada](/people/ada.md)`. Obsidian prefers `[[wikilinks]]` and resolves a leading
+`/` against the vault root, which usually works but is not what Obsidian itself
+would write. We keep OKF's form: portability across MkDocs, Hugo and plain
+`cat` matters more than one tool's native syntax.
+
+### Footnote labels and ULID prefixes
+
+A label is `e` + the **last 10 characters** of the event id. The last, not the
+first: a ULID starts with a millisecond timestamp, so events added in one sitting
+share a long prefix. Deriving labels from the front gave several distinct events
+the same label — every citation on a page collapsed into one, and provenance was
+silently wrong. `lw doctor` now rejects a page whose `sources` reuse an id for
+different resources.

@@ -38,6 +38,31 @@ impl Page {
             .and_then(|value| value.as_str())
     }
 
+    /// `(id, resource)` for every source entry that has an id.
+    pub fn source_entries(&self) -> Vec<(String, String)> {
+        let mut entries = Vec::new();
+        if let Some(sources) = self
+            .frontmatter
+            .get(serde_yaml::Value::from("sources"))
+            .and_then(|value| value.as_sequence())
+        {
+            for entry in sources {
+                let Some(map) = entry.as_mapping() else { continue };
+                let id = map
+                    .get(serde_yaml::Value::from("id"))
+                    .and_then(|v| v.as_str());
+                let resource = map
+                    .get(serde_yaml::Value::from("resource"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(id) = id {
+                    entries.push((id.to_string(), resource.to_string()));
+                }
+            }
+        }
+        entries
+    }
+
     pub fn source_ids(&self) -> HashSet<String> {
         let mut ids = HashSet::new();
         if let Some(sources) = self
@@ -57,6 +82,24 @@ impl Page {
         }
         ids
     }
+}
+
+/// The footnote label for an event id.
+///
+/// Uses the *last* 10 characters, not the first: a ULID begins with a
+/// millisecond timestamp, so events written in the same sitting share a long
+/// common prefix. Taking the front produced identical labels for different
+/// events, which silently collapsed distinct citations into one.
+pub fn footnote_label(event_id: &str) -> String {
+    let suffix: String = event_id
+        .chars()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("e{suffix}")
 }
 
 /// Split a document into frontmatter and body.
@@ -90,6 +133,24 @@ pub fn validate(content: &str) -> Result<Page> {
         Some(value) if !value.trim().is_empty() => {}
         Some(_) => bail!("frontmatter `type` must not be empty"),
         None => bail!("frontmatter must contain a `type` field (OKF SPEC §11)"),
+    }
+
+    // Two sources sharing an id makes attribution ambiguous: a footnote
+    // pointing at that id no longer identifies which event it came from. This
+    // happened for real when labels were derived from a ULID's shared timestamp
+    // prefix, so it is checked rather than assumed.
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (id, resource) in page.source_entries() {
+        if let Some(existing) = seen.get(&id) {
+            if existing != &resource {
+                bail!(
+                    "two different sources both use id `{id}` ({existing} and \
+                     {resource}); every source needs a distinct id or footnote \
+                     attribution is ambiguous"
+                );
+            }
+        }
+        seen.insert(id, resource);
     }
 
     // Footnote labels must resolve to a sources id. Keyed rather than
@@ -175,5 +236,42 @@ mod tests {
         let content = "---\ntype: Person\nsources:\n  - id: e01K2C5\n    resource: /log/2026-08.jsonl#01K2C5\n---\n\nBirthday is 14 March.[^e01K2C5]\n\n[^e01K2C5]: \"Ada's birthday is 14 March.\"\n";
         let page = validate(content).unwrap();
         assert!(page.source_ids().contains("e01K2C5"));
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    /// The bug this guards against: two events recorded in the same millisecond
+    /// share a long ULID prefix, so taking the front gave both the same label.
+    #[test]
+    fn labels_differ_for_events_in_the_same_millisecond() {
+        let a = "01KZYYFAS6FQ8797S8MYJB4MVV";
+        let b = "01KZYYFASQY0C0RB49XQT61J13";
+        assert_eq!(&a[..8], &b[..8], "precondition: prefixes really do collide");
+        assert_ne!(footnote_label(a), footnote_label(b));
+    }
+
+    #[test]
+    fn label_is_stable_and_prefixed() {
+        let label = footnote_label("01KZYYFAS6FQ8797S8MYJB4MVV");
+        assert_eq!(label, "eS8MYJB4MVV");
+        assert!(label.starts_with('e'));
+        assert_eq!(label.len(), 11, "e + 10 characters");
+    }
+
+    #[test]
+    fn rejects_two_sources_with_the_same_id() {
+        let content = "---\ntype: Person\nsources:\n  - id: eDUPLICATE\n    resource: /log/a.jsonl#1\n  - id: eDUPLICATE\n    resource: /log/a.jsonl#2\n---\n\nHi.\n";
+        let error = validate(content).unwrap_err().to_string();
+        assert!(error.contains("eDUPLICATE"), "{error}");
+        assert!(error.contains("ambiguous"), "{error}");
+    }
+
+    #[test]
+    fn allows_the_same_source_listed_twice_identically() {
+        let content = "---\ntype: Person\nsources:\n  - id: eSAME\n    resource: /log/a.jsonl#1\n  - id: eSAME\n    resource: /log/a.jsonl#1\n---\n\nHi.\n";
+        assert!(validate(content).is_ok());
     }
 }

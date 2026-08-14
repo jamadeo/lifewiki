@@ -560,29 +560,39 @@ description: One line, used in listings.
 tags: [family]
 generated: { by: <the actor string you are given>, at: <the timestamp you are given> }
 sources:
-  - id: e01K2C57T
+  - id: e3ZR4H2J9C
     resource: /log/2026-08.jsonl#01K2C57TDA6P1YQ8W3ZR4H2J9C
     title: "the event text, quoted"
 ---
 
 # Facts
 
-Ada's birthday is 14 March.[^e01K2C57T]
+Ada's birthday is 14 March, and she works as an architect.[^e3ZR4H2J9C]
 
-[^e01K2C57T]: "Ada's birthday is the 14th of March, not the 4th."
+[^e3ZR4H2J9C]: "Ada's birthday is the 14th of March, not the 4th."
 
 RULES FOR WRITING:
   - `type` is required and must not be empty.
   - Cite the event behind a claim with a footnote whose label matches a
-    `sources` entry id. Use `e` followed by the first 8 characters of the event
-    id. A footnote with no matching source will be rejected.
+    `sources` entry id. Always use the exact label given for each event below —
+    do not invent or shorten it. A footnote with no matching source will be
+    rejected.
+  - Each distinct event gets its own footnote label. Never reuse one label for
+    two different events.
   - When you rewrite a page, keep the sources for claims that remain, and drop
     sources whose claims are gone.
+  - Cite once per claim, at the end of the sentence or paragraph it supports.
+    Repeating the same footnote several times in one sentence is noise; markdown
+    renderers show it as a repeated marker pointing at the same note.
   - write_page replaces the whole file. Include everything the page should
     still say, not just your changes.
   - Prefer few, substantial pages over many thin ones. Add to an existing page
     when the subject already has one.
   - Use paths like /people/ada.md, /projects/lifewiki.md, /opinions/food.md.
+  - Link the first mention of any person, place or project that has its own
+    page: `[Ada](/people/ada.md)`. These links are how a reader — and you, on a
+    later run — navigate between related pages, so they are worth adding
+    whenever a page already exists for the subject.
 
 IF YOU CANNOT PLACE AN EVENT — it is too vague to attach to anything, such as
 "I changed my mind about that" with no referent — do not guess. Append it to
@@ -601,10 +611,10 @@ fn kickoff(events: &[Event], actor: &str, timestamp: &str) -> String {
     );
     for event in events {
         text.push_str(&format!(
-            "- id: {}\n  recorded: {}\n  footnote label: e{}\n  text: {:?}\n",
+            "- id: {}\n  recorded: {}\n  footnote label: {}\n  text: {:?}\n",
             event.id,
             event.ts,
-            &event.id[..8],
+            crate::okf::footnote_label(&event.id),
             event.text()
         ));
     }
