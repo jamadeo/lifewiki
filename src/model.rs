@@ -207,7 +207,7 @@ impl Backend for LocalBackend {
 /// Default local model. Small enough to run on a laptop; see the note in
 /// `docs/pipeline.md` about tool-calling quality.
 #[cfg(feature = "local")]
-pub const DEFAULT_LOCAL_MODEL: &str = "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M";
+pub const DEFAULT_LOCAL_MODEL: &str = "unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M";
 
 /// `[model]` section of config.toml.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -247,19 +247,20 @@ struct ConfigFile {
 }
 
 impl ModelSettings {
-    /// Override the configured provider, e.g. from `--local`. A model name
-    /// that was the default for the *old* provider is cleared, so the new
-    /// provider picks its own default rather than inheriting a name it cannot
-    /// serve.
+    /// Override the configured provider, e.g. from `--local`.
+    ///
+    /// The model name is always cleared, so the new provider picks its own
+    /// default. Carrying it over only worked when the old name happened to be
+    /// our hardcoded default: with `name = "claude-opus-5"` in config, `--local`
+    /// asked the local provider for a model called `claude-opus-5`. A name is
+    /// meaningful only to the provider it was written for.
+    ///
+    /// To pin a specific local model, set it in config.toml under
+    /// `provider = "local"` rather than combining it with the flag.
     pub fn with_provider(&self, provider: &str) -> Self {
-        let name = if self.name == default_model_name() {
-            String::new()
-        } else {
-            self.name.clone()
-        };
         Self {
             provider: provider.to_string(),
-            name,
+            name: String::new(),
             timeout_seconds: self.timeout_seconds,
         }
     }

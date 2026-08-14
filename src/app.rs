@@ -97,12 +97,17 @@ enum CommandName {
     /// recent entries backed up off-machine between builds.
     Sync,
 
-    /// Check the log for damage.
+    /// Check the log and wiki for damage.
     ///
-    /// Verifies that every line in every month file parses as a valid entry.
-    /// A crash mid-write can leave a torn final line; that is the case this is
-    /// built to find. Reports problems without changing anything unless
-    /// --repair is given.
+    /// For the log: that every line in every month file parses as a valid
+    /// entry. A crash mid-write can leave a torn final line; that is the case
+    /// this is built to find.
+    ///
+    /// For the wiki: that every page still conforms to OKF, and that internal
+    /// links resolve. Pages are validated when written, but a hand-edit or a
+    /// deleted page can break them afterwards.
+    ///
+    /// Reports problems without changing anything unless --repair is given.
     Doctor {
         /// Quarantine damaged lines instead of only reporting them.
         ///
@@ -173,6 +178,32 @@ enum CommandName {
         /// Print only the final summary.
         #[arg(short, long, conflicts_with = "verbose")]
         quiet: bool,
+    },
+
+    /// Ask a question about your life, answered from the wiki.
+    ///
+    /// Searches the wiki, reads what looks relevant, and answers in prose,
+    /// citing the pages used. Read-only: a question cannot change the wiki.
+    ///
+    ///   lw ask "when did I start running again?"
+    ///
+    /// Answers come only from the wiki, so anything you have not recorded is
+    /// unknown to it. It is instructed to say so rather than guess.
+    #[command(visible_alias = "q")]
+    Ask {
+        /// The question. Quoting is optional.
+        #[arg(trailing_var_arg = true, value_name = "QUESTION")]
+        question: Vec<String>,
+        /// Give up after this many agent turns.
+        #[arg(long, default_value_t = crate::ask::DEFAULT_MAX_TURNS, value_name = "N")]
+        max_turns: usize,
+        /// Run inference locally instead of using the configured provider.
+        #[cfg(feature = "local")]
+        #[arg(long)]
+        local: bool,
+        /// Show the search and reading as it happens.
+        #[arg(short, long)]
+        verbose: bool,
     },
 
     /// Discard the wiki and derive it again from the whole log.
@@ -259,15 +290,7 @@ pub fn run() -> Result<()> {
         CommandName::Sync => sync(&home),
         CommandName::Doctor { repair } => {
             paths::require_initialized(&home)?;
-            let problems = Log::open(&home)?.check(repair)?;
-            if problems.is_empty() {
-                println!("log is healthy");
-            } else {
-                for p in problems {
-                    println!("{p}");
-                }
-            }
-            Ok(())
+            doctor(&home, repair)
         }
         CommandName::Build {
             into,
@@ -295,6 +318,20 @@ pub fn run() -> Result<()> {
                     provider_override: None,
                 },
             )
+        }
+        CommandName::Ask {
+            question,
+            max_turns,
+            #[cfg(feature = "local")]
+            local,
+            verbose,
+        } => {
+            paths::require_initialized(&home)?;
+            #[cfg(feature = "local")]
+            let provider_override = local.then(|| "local".to_string());
+            #[cfg(not(feature = "local"))]
+            let provider_override: Option<String> = None;
+            ask(&home, question, max_turns, provider_override, verbose)
         }
         CommandName::Rebuild {
             into,
@@ -535,6 +572,150 @@ fn run_build(home: &Path, options: crate::build::Options) -> Result<()> {
         println!("\nNot committed.");
     }
     Ok(())
+}
+
+fn ask(
+    home: &Path,
+    question: Vec<String>,
+    max_turns: usize,
+    provider_override: Option<String>,
+    verbose: bool,
+) -> Result<()> {
+    let question = capture_text(question)?;
+    if question.trim().is_empty() {
+        bail!("no question given");
+    }
+
+    let wiki = home.join("wiki");
+    // A wiki with only the index has nothing to answer from, and "not in the
+    // wiki" would be a misleading answer when the real problem is no build.
+    let pages = walk_markdown(&wiki)?
+        .into_iter()
+        .filter(|path| {
+            path.file_name().map(|name| name != crate::index::FILENAME).unwrap_or(true)
+        })
+        .count();
+    if pages == 0 {
+        bail!(
+            "the wiki has no pages yet, so there is nothing to answer from.\n\
+             Run `lw build` first."
+        );
+    }
+
+    let mut settings = crate::model::ModelSettings::load(home)?;
+    if let Some(provider) = &provider_override {
+        settings = settings.with_provider(provider);
+    }
+    let backend = crate::model::build(&settings)?;
+
+    let mut asker = crate::ask::Asker::new(backend);
+    asker.max_turns = max_turns;
+    asker.reporter = std::sync::Arc::new(crate::progress::Reporter::new(if verbose {
+        crate::progress::Verbosity::Verbose
+    } else {
+        crate::progress::Verbosity::Quiet
+    }));
+
+    let answer = asker.ask(home, &wiki, &question).map_err(|error| {
+        // A small local model can spiral rather than concluding a fact is
+        // absent, and exhausting the context is how that presents. The raw
+        // provider message doesn't hint at the actual cause.
+        // `{:#}` walks the cause chain: to_string() shows only the outermost
+        // context, which hides the provider's actual complaint.
+        if format!("{error:#}").contains("Context length exceeded") {
+            anyhow::anyhow!(
+                "the model ran out of context without reaching an answer.\n\
+                 This usually means the wiki does not cover the question, and the \
+                 model kept looking instead of saying so.\n\
+                 Small local models are especially prone to it; try rephrasing, or \
+                 use a hosted provider for this question."
+            )
+        } else {
+            error
+        }
+    })?;
+    println!("{}", answer.text.trim());
+    if verbose {
+        if !answer.pages_read.is_empty() {
+            eprintln!("\nRead: {}", answer.pages_read.join(", "));
+        }
+        eprintln!(
+            "{} turn{}, {} in / {} out tokens",
+            answer.turns,
+            if answer.turns == 1 { "" } else { "s" },
+            answer.usage.input_tokens.unwrap_or(0),
+            answer.usage.output_tokens.unwrap_or(0)
+        );
+    }
+    Ok(())
+}
+
+fn doctor(home: &Path, repair: bool) -> Result<()> {
+    let mut problems = Log::open(home)?.check(repair)?;
+    if problems.is_empty() {
+        println!("log is healthy");
+    } else {
+        for problem in &problems {
+            println!("{problem}");
+        }
+    }
+
+    // Pages are validated when written, but a hand-edit or a deleted page can
+    // break them afterwards, so the same gate runs again here.
+    let wiki = home.join("wiki");
+    let mut wiki_problems = Vec::new();
+    for path in walk_markdown(&wiki)? {
+        let relative = path.strip_prefix(&wiki).unwrap_or(&path).to_string_lossy();
+        if relative == crate::index::FILENAME {
+            // The index has no frontmatter by design (OKF SPEC §8).
+            continue;
+        }
+        let raw = fs::read_to_string(&path)?;
+        if let Err(error) = crate::okf::validate(&raw) {
+            wiki_problems.push(format!("wiki/{relative}: {error}"));
+        }
+    }
+    for dangling in crate::index::dangling_links(&wiki)? {
+        wiki_problems.push(format!(
+            "wiki{} links to {}, which does not exist",
+            dangling.from, dangling.to
+        ));
+    }
+
+    if wiki_problems.is_empty() {
+        println!("wiki is healthy");
+    } else {
+        for problem in &wiki_problems {
+            println!("{problem}");
+        }
+    }
+
+    problems.extend(wiki_problems);
+    if !problems.is_empty() && !repair {
+        println!("\n{} problem(s) found.", problems.len());
+    }
+    Ok(())
+}
+
+fn walk_markdown(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    if !dir.is_dir() {
+        return Ok(found);
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            found.extend(walk_markdown(&path)?);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            found.push(path);
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 fn verbosity(verbose: bool, quiet: bool) -> crate::progress::Verbosity {

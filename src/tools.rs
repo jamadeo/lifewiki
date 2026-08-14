@@ -25,6 +25,8 @@ pub struct Journal {
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
+    /// Repository root, set when the log should be readable (`lw ask`).
+    pub home: Option<std::path::PathBuf>,
     root: PathBuf,
     pub journal: Journal,
     /// When false, `write_page` and `delete_page` refuse. Used for dry runs.
@@ -43,6 +45,7 @@ impl Workspace {
         Ok(Self {
             root,
             journal: Journal::default(),
+            home: None,
             writable: true,
         })
     }
@@ -196,7 +199,8 @@ fn tool(
 }
 
 /// The toolset offered to the reconciliation agent.
-pub fn definitions() -> Vec<Tool> {
+/// Tools for reading the wiki. Shared by the build agent and `lw ask`.
+fn read_tools() -> Vec<Tool> {
     vec![
         tool(
             "list_pages",
@@ -217,6 +221,13 @@ pub fn definitions() -> Vec<Tool> {
             json!({"path": {"type": "string", "description": "Bundle-absolute path, e.g. /people/ada.md"}}),
             &["path"],
         ),
+    ]
+}
+
+/// The full tool set for a build: read, write, and finish.
+pub fn definitions() -> Vec<Tool> {
+    let mut tools = read_tools();
+    tools.extend([
         tool(
             "write_page",
             "Create or overwrite a page. Content must be a complete OKF document: YAML \
@@ -241,7 +252,36 @@ pub fn definitions() -> Vec<Tool> {
             json!({"summary": {"type": "string", "description": "What changed, and why."}}),
             &["summary"],
         ),
-    ]
+    ]);
+    tools
+}
+
+/// Tools for answering a question: reading only, plus reading the log.
+///
+/// `read_event` is offered here but not to the build agent. When answering, the
+/// exact words behind a claim are often the real answer ("what did I say about
+/// the trip?"), and the wiki only paraphrases. During a build the events are
+/// supplied directly, so browsing the log would only invite folding facts
+/// nobody asked about.
+pub fn ask_definitions() -> Vec<Tool> {
+    let mut tools = read_tools();
+    tools.extend([
+        tool(
+            "read_event",
+            "Read the original log entry behind a citation, given its event id. Page \
+             footnotes cite these ids in their `sources` frontmatter. Use it when the \
+             user's exact words matter more than the wiki's summary.",
+            json!({"id": {"type": "string", "description": "Event id, or a unique prefix."}}),
+            &["id"],
+        ),
+        tool(
+            "answer",
+            "Call when you can answer the question. Cite the pages you used.",
+            json!({"text": {"type": "string", "description": "The answer, in prose."}}),
+            &["text"],
+        ),
+    ]);
+    tools
 }
 
 /// Execute a tool call. Returns (text_for_model, is_error).
@@ -276,6 +316,19 @@ pub fn dispatch(workspace: &mut Workspace, name: &str, arguments: &Value) -> (St
             })
         }
         "read_page" => workspace.read_page(&argument("path")?),
+        "read_event" => {
+            let home = workspace
+                .home
+                .as_ref()
+                .context("the log is not available in this context")?;
+            let event = crate::log::Log::open(home)?.resolve_prefix(&argument("id")?)?;
+            Ok(format!(
+                "id: {}\nrecorded: {}\ntext: {}",
+                event.id,
+                event.ts,
+                event.text()
+            ))
+        }
         "write_page" => {
             let path = argument("path")?;
             workspace.write_page(&path, &argument("content")?)?;

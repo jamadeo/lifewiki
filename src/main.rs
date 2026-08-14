@@ -1,6 +1,8 @@
 mod app;
+mod ask;
 mod build;
 mod git;
+mod index;
 mod model;
 mod okf;
 mod reconcile;

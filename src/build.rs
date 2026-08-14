@@ -234,6 +234,26 @@ pub fn build_with(
 
     let outcome = result?;
 
+    // Deterministic, so it runs after the agent rather than being left to it:
+    // the index is mechanical, and a model would only introduce drift (S41).
+    // Also restores the file that `rebuild` cleared.
+    let indexed = crate::index::write(&wiki).context("could not write wiki/index.md")?;
+    if indexed > 0 || options.rebuild {
+        reporter_note(&options, &format!("index.md lists {indexed} pages"));
+    }
+
+    // Reported, not fatal: the wiki is more useful with a few broken links than
+    // not written at all, and the agent may simply not have made a page yet.
+    for dangling in crate::index::dangling_links(&wiki)? {
+        reporter_note(
+            &options,
+            &format!(
+                "warning: {} links to {}, which does not exist",
+                dangling.from, dangling.to
+            ),
+        );
+    }
+
     if options.dry_run {
         return Ok(Report {
             events: events.len(),
@@ -298,6 +318,13 @@ fn clear_markdown(wiki: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A one-off note at the end of a build, respecting -q.
+fn reporter_note(options: &Options, text: &str) {
+    if options.verbosity != crate::progress::Verbosity::Quiet {
+        eprintln!("  {text}");
+    }
 }
 
 fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {

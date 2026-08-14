@@ -147,7 +147,7 @@ Rebuilding from scratch (`lw rebuild`) replays the whole log into an empty wiki.
 Expensive, but it's the escape hatch that lets us change prompts and page
 conventions later without being stuck with old decisions.
 
-## Layer 3 — the agent
+## Layer 3 — the agent (implemented: `lw ask`)
 
 `lw ask "when did I start running again?"` — a tool-using loop with read-only
 access: grep the wiki, read pages, read the log, read git history. It answers

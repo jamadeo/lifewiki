@@ -79,15 +79,31 @@ Capture and read the log — fast, offline, no model:
 | `lw doctor` | Check the log for damage. |
 | `lw redact <id> --reason <why>` | Erase one entry's text. See below. |
 
-Build the wiki — needs a model, costs money, takes time:
+Build and query the wiki — needs a model, costs money, takes time:
 
 | | |
 |---|---|
 | `lw build` | Fold new entries into the wiki. |
 | `lw rebuild --force` | Discard the wiki and derive it again from the whole log. |
+| `lw ask <question>` | Answer a question from the wiki. Read-only. |
 
-`lw <command> --help` explains any of them. `add`, `log`, `search`, `build` and
-`rebuild` have short aliases (`a`, `ls`, `s`, `b`, `rb`).
+`lw <command> --help` explains any of them. `add`, `log`, `search`, `build`,
+`rebuild` and `ask` have short aliases (`a`, `ls`, `s`, `b`, `rb`, `q`).
+
+### Asking
+
+```
+$ lw ask "who are my children and when were they born?"
+Your children are Rian, born 4 May 2021, and Avi, born 26 August 2023.
+(Sources: /people/avi.md, /people/rian.md)
+```
+
+Answers come only from the wiki, and it is told to say so when something isn't
+there rather than guess — this is a record of your own life, so a confident wrong
+answer is worse than none. `-v` shows the searching and reading as it happens.
+
+A question can never modify the wiki: the workspace is opened read-only *and*
+the write tools aren't offered to the model.
 
 ### Watching a build
 
@@ -175,22 +191,24 @@ it there needs `git filter-repo`. See [docs/event-log.md](docs/event-log.md).
 
 ## Status
 
-Phases 1 and 2 work end to end: capture, and a wiki that reconciles itself.
-Phase 3 — `lw ask`, querying the wiki in prose — is designed but not built.
+All three phases work end to end: capture, a wiki that reconciles itself, and
+prose questions answered from it — including fully offline with a local model.
 
 Known gaps:
 
-- **`wiki/index.md` is not maintained.** `lw init` creates it and `lw rebuild`
-  deletes it, and nothing regenerates it. OKF specifies an index of titles and
-  descriptions; it would also give the agent a cheap way to route over pages it
-  hasn't read.
-- **Cross-links depend on the model remembering to add them.** Nothing validates
-  that a link resolves to a real page.
-- **`lw doctor` only checks that log lines parse.** It doesn't validate wiki
-  conformance, though the same OKF checks that gate every write could be reused.
 - **The agent can fail to search for the right thing.** Bounded turns and
   validated writes protect the wiki's integrity, not its accuracy. A missed
-  contradiction leaves a stale fact with nothing marking it.
+  contradiction leaves a stale fact behind with nothing marking it. This is the
+  central risk of the design and no amount of validation fixes it.
+- **Dangling links are reported, not prevented.** A per-write check would reject
+  the agent's legitimate habit of linking a page it is about to create, so
+  `lw build` and `lw doctor` warn instead.
+- **Small local models struggle with `ask`.** Reconciliation and question
+  answering both need many well-formed tool calls; a small model will sometimes
+  keep searching rather than concluding a fact is absent, and exhaust its
+  context.
+- **No `index.md` in subdirectories.** Only the bundle root gets one, though OKF
+  permits them at any level.
 
 ## Documentation
 

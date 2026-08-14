@@ -168,6 +168,35 @@ pub fn validate(content: &str) -> Result<Page> {
     Ok(page)
 }
 
+/// Bundle-absolute page links in a body, e.g. `[Ada](/people/ada.md)`.
+///
+/// Only internal links to markdown pages are returned: external URLs and
+/// anchors are somebody else's problem.
+pub fn page_links(body: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let bytes: Vec<char> = body.chars().collect();
+    let mut index = 0;
+    while index < bytes.len() {
+        // Find `](` — the boundary between a markdown link's text and target.
+        if bytes[index] == ']' && index + 1 < bytes.len() && bytes[index + 1] == '(' {
+            let mut end = index + 2;
+            while end < bytes.len() && bytes[end] != ')' {
+                end += 1;
+            }
+            if end < bytes.len() {
+                let target: String = bytes[index + 2..end].iter().collect();
+                let target = target.split_whitespace().next().unwrap_or("").to_string();
+                if target.starts_with('/') && target.ends_with(".md") {
+                    links.push(target);
+                }
+            }
+            index = end;
+        }
+        index += 1;
+    }
+    links
+}
+
 /// Footnote labels referenced in the body, e.g. `[^e01K2C5]`, excluding the
 /// definition lines themselves.
 fn footnote_references(body: &str) -> HashSet<String> {
