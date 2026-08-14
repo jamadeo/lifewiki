@@ -16,6 +16,7 @@ clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"
 goose-agent = "0.1.0-alpha.6"
 goose-providers = "0.1.0-alpha.6"
+goose-local-inference = { version = "0.1.0-alpha.6", optional = true }
 libc = "0.2"
 regex = "1.11"
 rmcp = "3.1"
@@ -26,3 +27,13 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = "0.7.19"
 toml = "0.8"
 ulid = "1.1"
+
+[features]
+default = []
+# Local, offline inference via llama.cpp. Compiles llama.cpp from source, so
+# it is off by default; see docs/pipeline.md.
+local = ["dep:goose-local-inference"]
+# Hardware acceleration. Each implies `local`.
+metal = ["local", "goose-local-inference/mlx"]
+cuda = ["local", "goose-local-inference/cuda"]
+vulkan = ["local", "goose-local-inference/vulkan"]

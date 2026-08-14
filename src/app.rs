@@ -56,6 +56,10 @@ enum CommandName {
         /// Maximum agent turns before the run fails.
         #[arg(long, default_value_t = crate::reconcile::DEFAULT_MAX_TURNS)]
         max_turns: usize,
+        /// Use local, offline inference instead of the configured provider.
+        #[cfg(feature = "local")]
+        #[arg(long)]
+        local: bool,
     },
     /// Rebuild the whole wiki from the log, discarding the current one.
     Rebuild {
@@ -68,6 +72,10 @@ enum CommandName {
         /// Required unless --into is given, since this discards the wiki.
         #[arg(long)]
         force: bool,
+        /// Use local, offline inference instead of the configured provider.
+        #[cfg(feature = "local")]
+        #[arg(long)]
+        local: bool,
     },
 }
 
@@ -135,6 +143,8 @@ pub fn run() -> Result<()> {
             to,
             dry_run,
             max_turns,
+            #[cfg(feature = "local")]
+            local,
         } => {
             paths::require_initialized(&home)?;
             run_build(
@@ -145,6 +155,10 @@ pub fn run() -> Result<()> {
                     rebuild: false,
                     dry_run,
                     max_turns,
+                    #[cfg(feature = "local")]
+                    provider_override: local.then(|| "local".to_string()),
+                    #[cfg(not(feature = "local"))]
+                    provider_override: None,
                 },
             )
         }
@@ -153,6 +167,8 @@ pub fn run() -> Result<()> {
             to,
             max_turns,
             force,
+            #[cfg(feature = "local")]
+            local,
         } => {
             paths::require_initialized(&home)?;
             if into.is_none() && !force {
@@ -169,6 +185,10 @@ pub fn run() -> Result<()> {
                     rebuild: true,
                     dry_run: false,
                     max_turns,
+                    #[cfg(feature = "local")]
+                    provider_override: local.then(|| "local".to_string()),
+                    #[cfg(not(feature = "local"))]
+                    provider_override: None,
                 },
             )
         }
@@ -192,7 +212,10 @@ fn init(home: &Path) -> Result<()> {
                 "# lifewiki configuration\n",
                 "# pending_warning_hours = 24\n\n",
                 "[model]\n",
-                "provider = \"anthropic\"   # anthropic | none\n",
+                "# anthropic | local | none\n",
+                "# `local` runs entirely offline and requires a binary built\n",
+                "# with --features local (or metal/cuda/vulkan).\n",
+                "provider = \"anthropic\"\n",
                 "name = \"claude-sonnet-4-5\"\n",
                 "timeout_seconds = 120\n",
             ),

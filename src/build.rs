@@ -60,6 +60,8 @@ pub struct Options {
     /// Run the agent but discard changes and skip the commit.
     pub dry_run: bool,
     pub max_turns: usize,
+    /// Override the provider from config.toml, e.g. "local" from `--local`.
+    pub provider_override: Option<String>,
 }
 
 impl Default for Options {
@@ -70,6 +72,7 @@ impl Default for Options {
             rebuild: false,
             dry_run: false,
             max_turns: crate::reconcile::DEFAULT_MAX_TURNS,
+            provider_override: None,
         }
     }
 }
@@ -83,7 +86,10 @@ pub struct Report {
 }
 
 pub fn build(home: &Path, options: Options) -> Result<Report> {
-    let settings = model::ModelSettings::load(home)?;
+    let mut settings = model::ModelSettings::load(home)?;
+    if let Some(provider) = &options.provider_override {
+        settings = settings.with_provider(provider);
+    }
 
     // Cheap checks first: a dirty tree or an up-to-date wiki should be
     // reported before we complain about a missing API key.

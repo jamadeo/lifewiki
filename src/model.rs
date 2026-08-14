@@ -122,6 +122,93 @@ impl Backend for AnthropicBackend {
     }
 }
 
+/// Local, offline inference via llama.cpp.
+///
+/// Behind the `local` feature because it compiles llama.cpp from source, which
+/// is a slow build and irrelevant to anyone using a hosted provider. Worth the
+/// trouble for this project specifically: the input is the user's entire life,
+/// and this is the option where none of it leaves the machine.
+#[cfg(feature = "local")]
+pub struct LocalBackend {
+    provider: goose_local_inference::LocalInferenceProvider,
+    config: ModelConfig,
+    model_name: String,
+}
+
+#[cfg(feature = "local")]
+impl LocalBackend {
+    pub async fn new(model_name: &str) -> Result<Self> {
+        let provider = goose_local_inference::LocalInferenceProvider::from_env()
+            .await
+            .context(
+                "could not start local inference.\n\
+                 The model is downloaded on first use and may take a while.",
+            )?;
+        Ok(Self {
+            provider,
+            config: ModelConfig::new(model_name),
+            model_name: model_name.to_string(),
+        })
+    }
+}
+
+#[cfg(feature = "local")]
+#[async_trait]
+impl Backend for LocalBackend {
+    fn actor(&self) -> String {
+        // Keep the local/ prefix: a page's provenance should make it obvious
+        // which pages were written by a small local model.
+        format!(
+            "lifewiki/local-{}",
+            self.model_name
+                .rsplit('/')
+                .next()
+                .unwrap_or(&self.model_name)
+                .replace([':', '.'], "-")
+        )
+    }
+
+    async fn complete(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<(Message, Usage)> {
+        let (reply, usage) = self
+            .provider
+            .complete(&self.config, system, messages, tools)
+            .await
+            .map_err(|error| {
+                // The upstream message points at goose's desktop UI, which
+                // doesn't exist here. Downloading models is goose's job, not
+                // ours, so point at its CLI instead.
+                let text = error.to_string();
+                if text.contains("not downloaded") || text.contains("Model not found") {
+                    anyhow::anyhow!(
+                        "local model `{}` is not downloaded.\n\
+                         Fetch it with goose, then retry:\n  \
+                         goose configure    # choose Local Inference and this model",
+                        self.model_name
+                    )
+                } else {
+                    anyhow::Error::from(error).context("local inference failed")
+                }
+            })?;
+        Ok((
+            reply,
+            Usage {
+                input_tokens: usage.usage.input_tokens,
+                output_tokens: usage.usage.output_tokens,
+            },
+        ))
+    }
+}
+
+/// Default local model. Small enough to run on a laptop; see the note in
+/// `docs/pipeline.md` about tool-calling quality.
+#[cfg(feature = "local")]
+pub const DEFAULT_LOCAL_MODEL: &str = "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M";
+
 /// `[model]` section of config.toml.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ModelSettings {
@@ -160,6 +247,23 @@ struct ConfigFile {
 }
 
 impl ModelSettings {
+    /// Override the configured provider, e.g. from `--local`. A model name
+    /// that was the default for the *old* provider is cleared, so the new
+    /// provider picks its own default rather than inheriting a name it cannot
+    /// serve.
+    pub fn with_provider(&self, provider: &str) -> Self {
+        let name = if self.name == default_model_name() {
+            String::new()
+        } else {
+            self.name.clone()
+        };
+        Self {
+            provider: provider.to_string(),
+            name,
+            timeout_seconds: self.timeout_seconds,
+        }
+    }
+
     pub fn load(home: &std::path::Path) -> Result<Self> {
         let path = home.join("config.toml");
         if !path.exists() {
@@ -177,8 +281,34 @@ pub fn build(settings: &ModelSettings) -> Result<Arc<dyn Backend>> {
     let timeout = Duration::from_secs(settings.timeout_seconds);
     match settings.provider.as_str() {
         "anthropic" => Ok(Arc::new(AnthropicBackend::new(&settings.name, timeout)?)),
+
+        #[cfg(feature = "local")]
+        "local" => {
+            let name = if settings.name.is_empty() || settings.name == default_model_name() {
+                DEFAULT_LOCAL_MODEL.to_string()
+            } else {
+                settings.name.clone()
+            };
+            // from_env is async but build() is called from sync code, so spin a
+            // short-lived runtime just to construct the provider.
+            let backend = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(LocalBackend::new(&name))?;
+            Ok(Arc::new(backend))
+        }
+
+        #[cfg(not(feature = "local"))]
+        "local" => bail!(
+            "this binary was built without local inference support.\n\
+             Rebuild with `cargo install --path . --features local` \
+             (or --features metal on Apple silicon, cuda, or vulkan)."
+        ),
+
         "none" | "stub" => Ok(Arc::new(StubBackend)),
-        other => bail!("unknown model provider `{other}`; expected `anthropic` or `none`"),
+        other => bail!(
+            "unknown model provider `{other}`; expected `anthropic`, `local`, or `none`"
+        ),
     }
 }
 

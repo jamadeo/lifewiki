@@ -30,6 +30,19 @@ directory.
 - `lw doctor [--repair]`
 - `lw redact <id-prefix> --reason <reason>`
 
+## Local inference
+
+To run entirely offline, with nothing leaving the machine:
+
+```sh
+cargo install --path . --features metal   # or: local, cuda, vulkan
+goose configure                           # download a local model
+lw build --local
+```
+
+Off by default because it compiles llama.cpp from source (requires `cmake`).
+Model downloads are handled by the goose CLI, not by lifewiki.
+
 ## Documentation
 
 - [`docs/design.md`](docs/design.md) — architecture and principles

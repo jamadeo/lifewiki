@@ -145,7 +145,7 @@ Configuration lives in `config.toml`:
 
 ```toml
 [model]
-provider = "anthropic"        # anthropic | ollama
+provider = "anthropic"        # anthropic | local | none
 name = "claude-sonnet-4-5"
 timeout_seconds = 120
 ```
@@ -153,6 +153,46 @@ timeout_seconds = 120
 The Anthropic path reads `ANTHROPIC_API_KEY` from the environment. It is covered
 by an `#[ignore]`d integration test (`cargo test -- --ignored`) rather than a
 mock, because the thing worth testing is that the real request shape is accepted.
+
+### Local inference (S33)
+
+`provider = "local"`, or `lw build --local`, runs inference entirely on the
+machine via `goose-local-inference` (llama.cpp). This matters more here than for
+most tools: the input is the user's entire life, and this is the configuration
+where none of it leaves the machine.
+
+It is **behind a cargo feature**, off by default:
+
+```sh
+cargo install --path . --features local     # portable CPU build
+cargo install --path . --features metal     # Apple silicon
+cargo install --path . --features cuda      # NVIDIA
+cargo install --path . --features vulkan
+```
+
+The gate is not incidental. `goose-local-inference` pulls in `llama-cpp-sys-2`,
+which compiles llama.cpp from source and therefore requires `cmake` and minutes
+of build time. Making every contributor pay that to work on the event log would
+be wrong, so a default build has no `--local` flag at all: the clap argument, the
+backend, and the dependency are all `#[cfg(feature = "local")]`. Asking for
+`--local` without it gives a clear message naming the feature to rebuild with.
+
+**We do not download models.** `goose-local-inference`'s own error points at
+goose's desktop UI, which does not exist for a CLI; we rewrite it to point at
+`goose configure`. Model management is goose's job, and duplicating it here would
+mean owning download progress, cancellation and disk layout for no benefit.
+
+Two caveats worth knowing before trusting a local build:
+
+- **Tool-calling quality is the constraint.** Reconciliation depends on a model
+  reliably emitting well-formed tool calls over many turns. Most of the featured
+  GGUF models declare `native_tool_calling: false` and are driven through an
+  emulation layer. The default is `unsloth/gemma-4-E4B-it-GGUF:Q4_K_M`, one of
+  the few with native support.
+- **Provenance records it.** A local run writes `generated.by:
+  lifewiki/local-gemma-4-E4B-it-GGUF-Q4_K_M`, so it is always visible which
+  pages were written by a small local model rather than a frontier one — which
+  matters when reviewing a wiki built by mixed providers.
 
 ## Prompt and page conventions live in the repo
 
