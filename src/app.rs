@@ -119,7 +119,14 @@ fn init(home: &Path) -> Result<()> {
     if !home.join("config.toml").exists() {
         fs::write(
             home.join("config.toml"),
-            "# lifewiki configuration\n# pending_warning_hours = 24\n",
+            concat!(
+                "# lifewiki configuration\n",
+                "# pending_warning_hours = 24\n\n",
+                "[model]\n",
+                "provider = \"anthropic\"   # anthropic | none\n",
+                "name = \"claude-sonnet-4-5\"\n",
+                "timeout_seconds = 120\n",
+            ),
         )?;
     }
     if !home.join("wiki/index.md").exists() {

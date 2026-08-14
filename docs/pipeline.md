@@ -97,6 +97,46 @@ fact. So:
   flag, not to treat as "nothing to do".
 - A failed page validation aborts the batch and reports which page and why.
 
+## Model access
+
+Provided by `goose-providers` 0.1.0-alpha.6 (S22), wrapped in a local `Model`
+trait (`src/model.rs`):
+
+```rust
+pub trait Model: Send + Sync {
+    fn actor(&self) -> String;              // OKF generated.by
+    fn complete(&self, request: Request) -> Result<Response>;
+}
+```
+
+The interface is deliberately small — a system prompt, one user turn, text back.
+No tools and no multi-turn state, because reconciliation is a pure function of
+(event, candidate pages). Three reasons for the wrapper:
+
+1. **Testability.** `StubModel` lets every deterministic part of the pipeline be
+   exercised with no API key and no network.
+2. **Containment.** The dependency is `0.1.0-alpha`; churn hits one file.
+3. **Provider freedom.** Anthropic, OpenAI, Google and Ollama are all reachable
+   through the same crate, so "run this entirely locally" — which matters when the
+   input is your whole life — is a config change, not a rewrite.
+
+`goose-agent` is *not* used here (S23). It's a tool-using state machine, which the
+pipeline doesn't need; it's the right tool for the phase 3 `lw ask` agent, which
+does.
+
+Configuration lives in `config.toml`:
+
+```toml
+[model]
+provider = "anthropic"        # anthropic | ollama
+name = "claude-sonnet-4-5"
+timeout_seconds = 120
+```
+
+The Anthropic path reads `ANTHROPIC_API_KEY` from the environment. It is covered
+by an `#[ignore]`d integration test (`cargo test -- --ignored`) rather than a
+mock, because the thing worth testing is that the real request shape is accepted.
+
 ## Prompt and page conventions live in the repo
 
 Prompts are versioned files (`prompts/*.md`), not string literals, because S20

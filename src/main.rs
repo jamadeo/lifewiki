@@ -1,4 +1,5 @@
 mod app;
+mod model;
 mod event;
 mod log;
 mod paths;
