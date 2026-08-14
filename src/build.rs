@@ -62,6 +62,7 @@ pub struct Options {
     pub max_turns: usize,
     /// Override the provider from config.toml, e.g. "local" from `--local`.
     pub provider_override: Option<String>,
+    pub verbosity: crate::progress::Verbosity,
 }
 
 impl Default for Options {
@@ -73,6 +74,7 @@ impl Default for Options {
             dry_run: false,
             max_turns: crate::reconcile::DEFAULT_MAX_TURNS,
             provider_override: None,
+            verbosity: crate::progress::Verbosity::Normal,
         }
     }
 }
@@ -174,6 +176,7 @@ pub fn build_with(
 
     let mut reconciler = Reconciler::new(backend.clone());
     reconciler.max_turns = options.max_turns;
+    reconciler.reporter = std::sync::Arc::new(crate::progress::Reporter::new(options.verbosity));
 
     let started = chrono::Local::now();
     let result = reconciler
@@ -383,6 +386,52 @@ mod integration {
 
     fn settings() -> model::ModelSettings {
         model::ModelSettings::default()
+    }
+
+    /// Not an assertion so much as a way to eyeball the live output:
+    /// `cargo test -- --nocapture progress_output`
+    #[test]
+    fn progress_output_is_visible() {
+        let dir = repo();
+        let home = dir.path();
+        Log::open(home)
+            .unwrap()
+            .append("Actually I prefer apples over oranges now".into())
+            .unwrap();
+        std::fs::write(
+            home.join("wiki/food.md"),
+            "---\ntype: Preference\n---\n\nOranges are the favourite.\n",
+        )
+        .unwrap();
+        crate::git::commit(home, &["wiki"], "seed").unwrap();
+
+        let backend = ScriptedBackend::new(vec![
+            ScriptedBackend::tool_call("search_wiki", serde_json::json!({"query": "oranges"})),
+            ScriptedBackend::tool_call("read_page", serde_json::json!({"path": "/food.md"})),
+            ScriptedBackend::tool_call(
+                "write_page",
+                serde_json::json!({"path": "/food.md", "content": "bad content"}),
+            ),
+            ScriptedBackend::tool_call(
+                "write_page",
+                serde_json::json!({
+                    "path": "/food.md",
+                    "content": "---\ntype: Preference\n---\n\nPrefers apples (since Aug 2026); previously oranges.\n"
+                }),
+            ),
+            ScriptedBackend::tool_call(
+                "finish",
+                serde_json::json!({"summary": "Updated fruit preference to apples, noting the change."}),
+            ),
+        ]);
+        let options = Options {
+            verbosity: match std::env::var("LW_TEST_VERBOSE") {
+                Ok(_) => crate::progress::Verbosity::Verbose,
+                Err(_) => crate::progress::Verbosity::Normal,
+            },
+            ..Options::default()
+        };
+        build_with(home, options, backend, &settings()).unwrap();
     }
 
     #[test]

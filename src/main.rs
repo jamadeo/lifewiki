@@ -8,6 +8,7 @@ mod tools;
 mod event;
 mod log;
 mod paths;
+mod progress;
 
 fn main() {
     if let Err(error) = app::run() {

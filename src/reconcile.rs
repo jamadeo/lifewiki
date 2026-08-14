@@ -14,6 +14,7 @@
 
 use crate::event::Event;
 use crate::model::{Backend, Usage};
+use crate::progress::Reporter;
 use crate::tools::{self, Workspace};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -47,6 +48,7 @@ pub struct Session {
     conversation: Conversation,
     workspace: Arc<Mutex<Workspace>>,
     record: Arc<Mutex<Record>>,
+    reporter: Arc<Reporter>,
 }
 
 #[derive(Default)]
@@ -73,6 +75,7 @@ struct Runtime {
     conversation: Mutex<Conversation>,
     workspace: Arc<Mutex<Workspace>>,
     record: Arc<Mutex<Record>>,
+    reporter: Arc<Reporter>,
 }
 
 #[async_trait]
@@ -83,6 +86,7 @@ impl SessionLoader<Session> for Runtime {
             conversation: self.conversation.lock().unwrap().clone(),
             workspace: self.workspace.clone(),
             record: self.record.clone(),
+            reporter: self.reporter.clone(),
         })
     }
 }
@@ -205,10 +209,14 @@ impl Operation<Session, ConversationEffect> for ToolExecutionOperation {
                 }
             };
 
+            session.reporter.tool_call(&name, &arguments);
+
             let (output, is_error) = {
                 let mut workspace = session.workspace.lock().unwrap();
                 tools::dispatch(&mut workspace, &name, &arguments)
             };
+
+            session.reporter.tool_result(&output, is_error);
 
             session.record.lock().unwrap().transcript.push(format!(
                 "[{turn}] {name}({}) -> {}{}",
@@ -268,7 +276,8 @@ impl Operation<Session, ConversationEffect> for FinishOperation {
             record
                 .transcript
                 .push(format!("[{turns}] finish: {summary}"));
-            record.summary = Some(summary);
+            record.summary = Some(summary.clone());
+            session.reporter.finished(&summary);
         }
 
         // Answer the tool call so the conversation stays well-formed, then stop.
@@ -349,10 +358,14 @@ impl Inference<Session, ConversationEffect> for InferenceRunner {
         input: InferenceInput,
         _emit: &Emitter,
     ) -> Result<OperationResult<ConversationEffect>> {
+        let next_turn = session.record.lock().unwrap().turns + 1;
+        session.reporter.thinking(next_turn);
+
         let (reply, usage) = self
             .backend
             .complete(&self.system, conversation.messages(), &input.tools)
             .await?;
+        session.reporter.model_text(&reply.as_concat_text());
 
         {
             let mut record = session.record.lock().unwrap();
@@ -385,6 +398,7 @@ fn is_finish(request: &ToolRequest) -> bool {
 pub struct Reconciler {
     backend: Arc<dyn Backend>,
     pub max_turns: usize,
+    pub reporter: Arc<Reporter>,
 }
 
 impl Reconciler {
@@ -392,6 +406,7 @@ impl Reconciler {
         Self {
             backend,
             max_turns: DEFAULT_MAX_TURNS,
+            reporter: Arc::new(Reporter::quiet()),
         }
     }
 
@@ -404,10 +419,14 @@ impl Reconciler {
         let workspace = Arc::new(Mutex::new(workspace));
         let record = Arc::new(Mutex::new(Record::default()));
 
+        self.reporter
+            .build_started(events.len(), &self.backend.actor());
+
         let runtime = Runtime {
             conversation: Mutex::new(Conversation::new_unvalidated([kickoff])),
             workspace: workspace.clone(),
             record: record.clone(),
+            reporter: self.reporter.clone(),
         };
 
         let inference = Arc::new(InferenceRunner {

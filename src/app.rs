@@ -60,6 +60,12 @@ enum CommandName {
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
+        /// Show the model's reasoning and full tool output.
+        #[arg(short, long)]
+        verbose: bool,
+        /// Print only the final summary.
+        #[arg(short, long, conflicts_with = "verbose")]
+        quiet: bool,
     },
     /// Rebuild the whole wiki from the log, discarding the current one.
     Rebuild {
@@ -76,6 +82,12 @@ enum CommandName {
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
+        /// Show the model's reasoning and full tool output.
+        #[arg(short, long)]
+        verbose: bool,
+        /// Print only the final summary.
+        #[arg(short, long, conflicts_with = "verbose")]
+        quiet: bool,
     },
 }
 
@@ -145,6 +157,8 @@ pub fn run() -> Result<()> {
             max_turns,
             #[cfg(feature = "local")]
             local,
+            verbose,
+            quiet,
         } => {
             paths::require_initialized(&home)?;
             run_build(
@@ -155,6 +169,7 @@ pub fn run() -> Result<()> {
                     rebuild: false,
                     dry_run,
                     max_turns,
+                    verbosity: verbosity(verbose, quiet),
                     #[cfg(feature = "local")]
                     provider_override: local.then(|| "local".to_string()),
                     #[cfg(not(feature = "local"))]
@@ -169,6 +184,8 @@ pub fn run() -> Result<()> {
             force,
             #[cfg(feature = "local")]
             local,
+            verbose,
+            quiet,
         } => {
             paths::require_initialized(&home)?;
             if into.is_none() && !force {
@@ -185,6 +202,7 @@ pub fn run() -> Result<()> {
                     rebuild: true,
                     dry_run: false,
                     max_turns,
+                    verbosity: verbosity(verbose, quiet),
                     #[cfg(feature = "local")]
                     provider_override: local.then(|| "local".to_string()),
                     #[cfg(not(feature = "local"))]
@@ -379,4 +397,13 @@ fn run_build(home: &Path, options: crate::build::Options) -> Result<()> {
         println!("\nNot committed.");
     }
     Ok(())
+}
+
+fn verbosity(verbose: bool, quiet: bool) -> crate::progress::Verbosity {
+    use crate::progress::Verbosity;
+    match (verbose, quiet) {
+        (true, _) => Verbosity::Verbose,
+        (_, true) => Verbosity::Quiet,
+        _ => Verbosity::Normal,
+    }
 }
