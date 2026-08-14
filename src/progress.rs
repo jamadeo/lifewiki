@@ -1,48 +1,29 @@
-//! Live progress output for builds.
+//! Live output for agent runs.
 //!
-//! A build makes many model calls and edits files you care about, so silence
-//! for a minute followed by a summary is the wrong default. Everything the
-//! agent does is printed as it happens, to stderr — stdout stays clean for the
-//! final report, so `lw build | tee` still gives a usable summary.
+//! A run makes many slow model calls and edits files you care about, so it
+//! narrates itself as it goes. Everything goes to stderr, leaving stdout for the
+//! result — so `lw ask ... > answer.txt` keeps working.
 
 use std::io::{IsTerminal, Write};
-use std::sync::Mutex;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Verbosity {
-    /// Only errors and the final summary.
-    Quiet,
-    /// Each tool call and its result. The default.
-    Normal,
-    /// Adds the model's prose, full arguments, and full tool output.
-    Verbose,
-}
 
 pub struct Reporter {
-    verbosity: Verbosity,
+    enabled: bool,
     colour: bool,
-    /// Serialises writes so concurrent turns can't interleave mid-line.
-    lock: Mutex<()>,
 }
 
 impl Reporter {
-    pub fn new(verbosity: Verbosity) -> Self {
+    pub fn new() -> Self {
         Self {
-            verbosity,
+            enabled: true,
             colour: std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
-            lock: Mutex::new(()),
         }
     }
 
-    pub fn quiet() -> Self {
-        Self::new(Verbosity::Quiet)
-    }
-
-    fn enabled(&self, level: Verbosity) -> bool {
-        match (self.verbosity, level) {
-            (Verbosity::Quiet, _) => false,
-            (Verbosity::Normal, Verbosity::Verbose) => false,
-            _ => true,
+    /// Prints nothing. For tests, and for `lw ask`, whose answer is the output.
+    pub fn silent() -> Self {
+        Self {
+            enabled: false,
+            colour: false,
         }
     }
 
@@ -55,15 +36,13 @@ impl Reporter {
     }
 
     fn line(&self, text: &str) {
-        let _guard = self.lock.lock().unwrap();
         let mut stderr = std::io::stderr();
         let _ = writeln!(stderr, "{text}");
         let _ = stderr.flush();
     }
 
-    /// The build is about to start.
-    pub fn build_started(&self, events: usize, actor: &str) {
-        if !self.enabled(Verbosity::Normal) {
+    pub fn started(&self, events: usize, actor: &str) {
+        if !self.enabled {
             return;
         }
         self.line(&format!(
@@ -74,9 +53,9 @@ impl Reporter {
         ));
     }
 
-    /// Waiting on the model. Printed before the call, since that's the slow bit.
+    /// Printed before the call, since that is where the seconds go.
     pub fn thinking(&self, turn: usize) {
-        if !self.enabled(Verbosity::Normal) {
+        if !self.enabled {
             return;
         }
         self.line(&format!(
@@ -86,9 +65,8 @@ impl Reporter {
         ));
     }
 
-    /// The model said something in prose.
     pub fn model_text(&self, text: &str) {
-        if !self.enabled(Verbosity::Verbose) || text.trim().is_empty() {
+        if !self.enabled || text.trim().is_empty() {
             return;
         }
         for line in text.trim().lines() {
@@ -96,16 +74,11 @@ impl Reporter {
         }
     }
 
-    /// A tool is about to run.
     pub fn tool_call(&self, name: &str, arguments: &serde_json::Value) {
-        if !self.enabled(Verbosity::Normal) {
+        if !self.enabled {
             return;
         }
-        let summary = if self.verbosity == Verbosity::Verbose {
-            arguments.to_string()
-        } else {
-            describe(name, arguments)
-        };
+        let summary = describe(name, arguments);
         self.line(&format!(
             "  {} {}{}",
             self.paint("1;34", "→"),
@@ -118,42 +91,31 @@ impl Reporter {
         ));
     }
 
-    /// A tool finished.
     pub fn tool_result(&self, output: &str, is_error: bool) {
-        if !self.enabled(Verbosity::Normal) {
+        if !self.enabled {
             return;
         }
-        if is_error {
-            // Always show the whole error: this is the agent correcting itself,
-            // and it's the most useful thing on screen when a build misbehaves.
-            for line in output.trim().lines() {
-                self.line(&format!("    {}", self.paint("1;31", line)));
-            }
-            return;
-        }
-        if self.verbosity == Verbosity::Verbose {
-            for line in output.trim().lines() {
-                self.line(&format!("    {}", self.paint("2", line)));
-            }
+        // Errors print in full: watching the agent correct itself is the most
+        // useful thing on screen when a run misbehaves.
+        let (code, lines) = if is_error {
+            ("1;31", output.trim().lines().collect::<Vec<_>>())
         } else {
-            let lines: Vec<&str> = output.trim().lines().collect();
-            let first = lines.first().copied().unwrap_or("");
-            let suffix = if lines.len() > 1 {
-                format!(" (+{} more lines)", lines.len() - 1)
-            } else {
-                String::new()
-            };
+            ("2", output.trim().lines().take(3).collect::<Vec<_>>())
+        };
+        let total = output.trim().lines().count();
+        for line in &lines {
+            self.line(&format!("    {}", self.paint(code, &truncate(line, 100))));
+        }
+        if total > lines.len() {
             self.line(&format!(
-                "    {}{}",
-                self.paint("2", &truncate(first, 100)),
-                self.paint("2", &suffix)
+                "    {}",
+                self.paint("2", &format!("… {} more lines", total - lines.len()))
             ));
         }
     }
 
-    /// The agent finished.
     pub fn finished(&self, summary: &str) {
-        if !self.enabled(Verbosity::Normal) {
+        if !self.enabled || summary.trim().is_empty() {
             return;
         }
         self.line(&format!(
@@ -161,6 +123,20 @@ impl Reporter {
             self.paint("1;32", "✓"),
             self.paint("32", summary)
         ));
+    }
+
+    pub fn note(&self, text: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.line(&format!("  {}", self.paint("2", text)));
+    }
+
+    pub fn warn(&self, text: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.line(&format!("  {}", self.paint("33", text)));
     }
 }
 
@@ -172,12 +148,12 @@ fn describe(name: &str, arguments: &serde_json::Value) -> String {
             .map(|query| format!("{query:?}"))
             .unwrap_or_default(),
         "read_page" | "delete_page" => field("path").unwrap_or("").to_string(),
-        "write_page" => {
-            let path = field("path").unwrap_or("");
-            let bytes = field("content").map(str::len).unwrap_or(0);
-            format!("{path} ({bytes} bytes)")
-        }
-        "finish" => String::new(),
+        "read_event" => field("id").unwrap_or("").to_string(),
+        "write_page" => format!(
+            "{} ({} bytes)",
+            field("path").unwrap_or(""),
+            field("content").map(str::len).unwrap_or(0)
+        ),
         _ => String::new(),
     }
 }
@@ -186,8 +162,7 @@ fn truncate(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
     }
-    let kept: String = text.chars().take(limit).collect();
-    format!("{kept}…")
+    format!("{}…", text.chars().take(limit).collect::<String>())
 }
 
 #[cfg(test)]
@@ -208,20 +183,6 @@ mod tests {
             "/a.md (5 bytes)"
         );
         assert_eq!(describe("finish", &serde_json::json!({})), "");
-    }
-
-    #[test]
-    fn quiet_prints_nothing() {
-        let reporter = Reporter::quiet();
-        assert!(!reporter.enabled(Verbosity::Normal));
-        assert!(!reporter.enabled(Verbosity::Verbose));
-    }
-
-    #[test]
-    fn normal_excludes_verbose_only_output() {
-        let reporter = Reporter::new(Verbosity::Normal);
-        assert!(reporter.enabled(Verbosity::Normal));
-        assert!(!reporter.enabled(Verbosity::Verbose));
     }
 
     #[test]

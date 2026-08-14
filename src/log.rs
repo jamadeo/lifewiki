@@ -158,7 +158,7 @@ impl Log {
         Ok(paths)
     }
 
-    pub fn check(&self, repair: bool) -> Result<Vec<String>> {
+    pub fn check(&self) -> Result<Vec<String>> {
         let mut problems = Vec::new();
         for path in self.month_files()? {
             let mut raw = String::new();
@@ -178,20 +178,11 @@ impl Log {
                 }) {
                     Ok(_) => {}
                     Err(_) if index + 1 == raw.split('\n').count() && !raw.ends_with('\n') => {
-                        let message = format!("{} has a torn final line", path.display());
-                        if repair {
-                            let quarantine = self.home.join("state/quarantine");
-                            fs::create_dir_all(&quarantine)?;
-                            let torn =
-                                format!("{}.torn", path.file_name().unwrap().to_string_lossy());
-                            fs::write(quarantine.join(torn), piece.as_bytes())?;
-                            let valid = &raw
-                                [..raw.rfind('\n').unwrap_or(0) + usize::from(raw.contains('\n'))];
-                            fs::write(&path, valid)?;
-                            problems.push(format!("repaired {message}"));
-                        } else {
-                            problems.push(message);
-                        }
+                        problems.push(format!(
+                            "{} has a torn final line; the last entry was not \
+                             written completely",
+                            path.display()
+                        ));
                     }
                     Err(error) => {
                         bail!("{} line {} is invalid: {error}", path.display(), index + 1)
@@ -216,7 +207,7 @@ fn read_file(path: &Path) -> Result<Vec<Event>> {
     }
     if !raw.is_empty() && !raw.ends_with('\n') {
         bail!(
-            "{} has a torn final line; run `lw doctor --repair`",
+            "{} has a torn final line",
             path.display()
         );
     }

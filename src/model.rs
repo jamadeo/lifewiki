@@ -204,6 +204,8 @@ impl Backend for LocalBackend {
     }
 }
 
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-5";
+
 /// Default local model. Small enough to run on a laptop; see the note in
 /// `docs/pipeline.md` about tool-calling quality.
 #[cfg(feature = "local")]
@@ -211,11 +213,10 @@ pub const DEFAULT_LOCAL_MODEL: &str = "unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M";
 
 /// Which agent a model is being built for.
 ///
-/// The two tasks want different things, so they are configured separately.
-/// Reconciliation rewrites files and must sustain many well-formed tool calls
-/// over a long run, which rewards a stronger model. Answering is short, read-only
-/// and much more frequent, so it is the sensible place to spend less — or to keep
-/// entirely local, since a question and its answer are as sensitive as the wiki.
+/// The two are configured independently. Reconciliation rewrites files over a
+/// long run and rewards a stronger model; answering is short, frequent and
+/// read-only, so it is the place to spend less — or to keep local, since a
+/// question is as sensitive as the wiki it reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Task {
     Build,
@@ -231,19 +232,21 @@ impl Task {
     }
 }
 
-/// Resolved settings for one task.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Settings for one task.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelSettings {
+    #[serde(default = "default_provider")]
     pub provider: String,
+    /// Empty means "the provider's own default".
+    #[serde(default)]
     pub name: String,
+    #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
 }
 
 fn default_provider() -> String {
     "anthropic".to_string()
-}
-fn default_model_name() -> String {
-    "claude-sonnet-4-5".to_string()
 }
 fn default_timeout() -> u64 {
     120
@@ -253,81 +256,25 @@ impl Default for ModelSettings {
     fn default() -> Self {
         Self {
             provider: default_provider(),
-            name: default_model_name(),
+            name: String::new(),
             timeout_seconds: default_timeout(),
         }
     }
 }
 
-/// One `[model]` table or sub-table as written. Every field is optional so a
-/// sub-table can override only what it cares about.
-#[derive(Debug, Default, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelTable {
-    provider: Option<String>,
-    name: Option<String>,
-    timeout_seconds: Option<u64>,
-    /// Overrides for `lw build` / `lw rebuild`.
-    #[serde(default)]
-    build: Option<Box<ModelTable>>,
-    /// Overrides for `lw ask`.
-    #[serde(default)]
-    ask: Option<Box<ModelTable>>,
-}
-
 #[derive(Debug, Default, serde::Deserialize)]
 struct ConfigFile {
     #[serde(default)]
-    model: ModelTable,
-}
-
-impl ModelTable {
-    /// Resolve for a task, letting the task's sub-table override the base.
-    fn resolve(&self, task: Task) -> ModelSettings {
-        let base_provider = self.provider.clone().unwrap_or_else(default_provider);
-        let specific = match task {
-            Task::Build => self.build.as_deref(),
-            Task::Ask => self.ask.as_deref(),
-        };
-
-        let provider = specific
-            .and_then(|table| table.provider.clone())
-            .unwrap_or_else(|| base_provider.clone());
-
-        // A model name means something only to the provider it was written for
-        // (S47). So a base `name` is inherited only when the task uses the same
-        // provider; otherwise the new provider picks its own default. Without
-        // this, `[model] name = "claude-opus-5"` plus `[model.ask] provider =
-        // "local"` would ask the local provider for claude-opus-5.
-        let name = specific
-            .and_then(|table| table.name.clone())
-            .or_else(|| {
-                if provider == base_provider {
-                    self.name.clone()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-
-        let timeout_seconds = specific
-            .and_then(|table| table.timeout_seconds)
-            .or(self.timeout_seconds)
-            .unwrap_or_else(default_timeout);
-
-        ModelSettings {
-            provider,
-            name,
-            timeout_seconds,
-        }
-    }
+    build: Option<ModelSettings>,
+    #[serde(default)]
+    ask: Option<ModelSettings>,
 }
 
 impl ModelSettings {
     /// Override the provider, e.g. from `--local`.
     ///
-    /// The model name is always cleared, for the reason given in
-    /// `ModelTable::resolve`.
+    /// The name is cleared with it: a model name means something only to the
+    /// provider it was written for.
     pub fn with_provider(&self, provider: &str) -> Self {
         Self {
             provider: provider.to_string(),
@@ -346,16 +293,19 @@ impl ModelSettings {
             .with_context(|| format!("could not read {}", path.display()))?;
         let parsed: ConfigFile = toml::from_str(&raw).with_context(|| {
             format!(
-                "{} is not valid TOML (or has an unknown key under [model]); \
-                 needed to resolve the model for `lw {}`",
+                "{} is not valid TOML; needed to resolve the model for `lw {}`",
                 path.display(),
                 task.name()
             )
         })?;
-        Ok(parsed.model.resolve(task))
+        let chosen = match task {
+            Task::Build => parsed.build,
+            Task::Ask => parsed.ask,
+        };
+        Ok(chosen.unwrap_or_default())
     }
 
-    /// A short description for logs and errors, e.g. `anthropic/claude-opus-5`.
+    /// A short description, e.g. `anthropic/claude-opus-5`.
     pub fn describe(&self) -> String {
         if self.name.is_empty() {
             format!("{} (default model)", self.provider)
@@ -370,11 +320,11 @@ pub fn build(settings: &ModelSettings) -> Result<Arc<dyn Backend>> {
     match settings.provider.as_str() {
         "anthropic" => {
             let name = if settings.name.is_empty() {
-                default_model_name()
+                DEFAULT_ANTHROPIC_MODEL
             } else {
-                settings.name.clone()
+                &settings.name
             };
-            Ok(Arc::new(AnthropicBackend::new(&name, timeout)?))
+            Ok(Arc::new(AnthropicBackend::new(name, timeout)?))
         }
 
         #[cfg(feature = "local")]
@@ -509,47 +459,27 @@ pub mod tests {
     }
 
     #[test]
-    fn both_tasks_share_the_base_table_by_default() {
-        let toml = "[model]\nprovider = \"anthropic\"\nname = \"claude-opus-5\"\n";
-        assert_eq!(settings(toml, Task::Build).name, "claude-opus-5");
-        assert_eq!(settings(toml, Task::Ask).name, "claude-opus-5");
-    }
-
-    #[test]
-    fn a_task_can_override_just_the_model() {
-        let toml = "[model]\nprovider = \"anthropic\"\nname = \"claude-sonnet-4-5\"\n\
-                    [model.build]\nname = \"claude-opus-5\"\n";
+    fn each_task_reads_its_own_table() {
+        let toml = "[build]\nprovider = \"anthropic\"\nname = \"claude-opus-5\"\n\n\
+                    [ask]\nprovider = \"local\"\n";
         let build = settings(toml, Task::Build);
         let ask = settings(toml, Task::Ask);
+        assert_eq!(build.provider, "anthropic");
         assert_eq!(build.name, "claude-opus-5");
-        assert_eq!(build.provider, "anthropic", "provider still inherited");
-        assert_eq!(ask.name, "claude-sonnet-4-5");
-    }
-
-    /// The point of the feature: answer locally, build with a hosted model.
-    #[test]
-    fn a_task_can_use_a_different_provider() {
-        let toml = "[model]\nprovider = \"anthropic\"\nname = \"claude-opus-5\"\n\
-                    [model.ask]\nprovider = \"local\"\n";
-        let ask = settings(toml, Task::Ask);
         assert_eq!(ask.provider, "local");
-        assert_eq!(
-            ask.name, "",
-            "a name written for anthropic must not follow the provider change"
-        );
+        assert_eq!(ask.name, "", "local picks its own default");
+    }
+
+    #[test]
+    fn a_missing_table_falls_back_to_defaults() {
+        let toml = "[build]\nname = \"claude-opus-5\"\n";
         assert_eq!(settings(toml, Task::Build).name, "claude-opus-5");
+        assert_eq!(settings(toml, Task::Ask), ModelSettings::default());
     }
 
     #[test]
-    fn a_task_may_pin_a_model_for_its_own_provider() {
-        let toml = "[model]\nprovider = \"anthropic\"\n\
-                    [model.ask]\nprovider = \"local\"\nname = \"some/model:Q4\"\n";
-        assert_eq!(settings(toml, Task::Ask).name, "some/model:Q4");
-    }
-
-    #[test]
-    fn timeout_is_inherited_and_overridable() {
-        let toml = "[model]\ntimeout_seconds = 300\n[model.ask]\ntimeout_seconds = 30\n";
+    fn timeout_is_per_task() {
+        let toml = "[build]\ntimeout_seconds = 300\n[ask]\ntimeout_seconds = 30\n";
         assert_eq!(settings(toml, Task::Build).timeout_seconds, 300);
         assert_eq!(settings(toml, Task::Ask).timeout_seconds, 30);
     }
@@ -557,18 +487,20 @@ pub mod tests {
     #[test]
     fn an_absent_config_still_works() {
         let dir = crate::tools::tests::tempdir::Dir::new();
-        let loaded = ModelSettings::load(dir.path(), Task::Build).unwrap();
-        assert_eq!(loaded, ModelSettings::default());
+        assert_eq!(
+            ModelSettings::load(dir.path(), Task::Build).unwrap(),
+            ModelSettings::default()
+        );
     }
 
-    /// A typo in a task name would otherwise be silently ignored, leaving the
-    /// user wondering why their override did nothing.
+    /// A typo would otherwise be silently ignored, leaving the user wondering
+    /// why their setting did nothing.
     #[test]
     fn an_unknown_key_is_an_error() {
         let dir = crate::tools::tests::tempdir::Dir::new();
         std::fs::write(
             dir.path().join("config.toml"),
-            "[model]\n[model.asking]\nprovider = \"local\"\n",
+            "[ask]\nprovder = \"local\"\n",
         )
         .unwrap();
         let error = ModelSettings::load(dir.path(), Task::Ask)
@@ -578,13 +510,28 @@ pub mod tests {
     }
 
     #[test]
-    fn describe_names_the_provider_and_model() {
+    fn with_provider_clears_the_name() {
         let settings = ModelSettings {
-            provider: "local".into(),
-            name: String::new(),
+            provider: "anthropic".into(),
+            name: "claude-opus-5".into(),
             timeout_seconds: 60,
         };
-        assert_eq!(settings.describe(), "local (default model)");
+        let local = settings.with_provider("local");
+        assert_eq!(local.provider, "local");
+        assert_eq!(local.name, "");
+    }
+
+    #[test]
+    fn describe_names_the_provider_and_model() {
+        assert_eq!(
+            ModelSettings {
+                provider: "local".into(),
+                name: String::new(),
+                timeout_seconds: 60,
+            }
+            .describe(),
+            "local (default model)"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Minimal OKF v0.2 conformance checking for wiki pages (S21).
+//! Minimal OKF v0.2 conformance checking for wiki pages.
 //!
 //! This is the gate on every agent write. A model that mangles frontmatter must
 //! produce a failed tool call it can retry, never a corrupt page on disk.
@@ -102,6 +102,42 @@ pub fn footnote_label(event_id: &str) -> String {
     format!("e{suffix}")
 }
 
+/// Every markdown page under a directory, sorted, skipping dotfiles.
+///
+/// Dotfiles are skipped because editors write state into the wiki: Obsidian
+/// creates `.obsidian/` merely by opening it.
+pub fn pages(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut found = Vec::new();
+    if !dir.is_dir() {
+        return Ok(found);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            found.extend(pages(&path)?);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            found.push(path);
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// A page's path relative to the wiki root, in OKF bundle-absolute form.
+pub fn bundle_path(wiki: &std::path::Path, page: &std::path::Path) -> String {
+    format!(
+        "/{}",
+        page.strip_prefix(wiki)
+            .unwrap_or(page)
+            .to_string_lossy()
+            .replace('\\', "/")
+    )
+}
+
 /// Split a document into frontmatter and body.
 pub fn parse(content: &str) -> Result<Page> {
     let rest = content
@@ -135,10 +171,8 @@ pub fn validate(content: &str) -> Result<Page> {
         None => bail!("frontmatter must contain a `type` field (OKF SPEC §11)"),
     }
 
-    // Two sources sharing an id makes attribution ambiguous: a footnote
-    // pointing at that id no longer identifies which event it came from. This
-    // happened for real when labels were derived from a ULID's shared timestamp
-    // prefix, so it is checked rather than assumed.
+    // Two sources sharing an id makes attribution ambiguous: a footnote pointing
+    // at that id does not identify which event it came from.
     let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (id, resource) in page.source_entries() {
         if let Some(existing) = seen.get(&id) {

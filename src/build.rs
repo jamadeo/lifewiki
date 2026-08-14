@@ -3,14 +3,14 @@
 //! The transactional shape matters more than the model call. A build must be
 //! idempotent (nothing new ⇒ no work, no commit), crash-safe (an interrupted
 //! run leaves a dirty tree that `git checkout` discards, and the cursor
-//! unmoved), and atomic (wiki, cursor and log move in one commit, so
-//! `git revert` of a build is complete).
+//! unmoved), and atomic (wiki and cursor move in one commit, so `git revert` of
+//! a build is complete).
 
 use crate::event::Event;
 use crate::git;
 use crate::log::Log;
 use crate::model::{self, Backend};
-use crate::reconcile::{Outcome, Reconciler};
+use crate::agent::{Agent, Outcome, BUILD};
 use crate::tools::Workspace;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -51,30 +51,20 @@ impl Cursor {
 }
 
 pub struct Options {
-    /// Write the wiki here instead of `<home>/wiki` (S17: prompt comparison).
+    /// Write the wiki here instead of `<home>/wiki`, for comparing prompts.
     pub into: Option<PathBuf>,
-    /// Stop at this event id inclusive (S17: reproducible bounded replay).
-    pub to: Option<String>,
     /// Start from an empty wiki and replay the whole log.
     pub rebuild: bool,
-    /// Run the agent but discard changes and skip the commit.
-    pub dry_run: bool,
-    pub max_turns: usize,
     /// Override the provider from config.toml, e.g. "local" from `--local`.
     pub provider_override: Option<String>,
-    pub verbosity: crate::progress::Verbosity,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             into: None,
-            to: None,
             rebuild: false,
-            dry_run: false,
-            max_turns: crate::reconcile::DEFAULT_MAX_TURNS,
             provider_override: None,
-            verbosity: crate::progress::Verbosity::Normal,
         }
     }
 }
@@ -83,7 +73,6 @@ impl Default for Options {
 pub struct Report {
     pub events: usize,
     pub outcome: Option<Outcome>,
-    pub run_dir: Option<PathBuf>,
     pub committed: bool,
 }
 
@@ -100,20 +89,19 @@ pub fn build(home: &Path, options: Options) -> Result<Report> {
         return Ok(Report {
             events: 0,
             outcome: None,
-            run_dir: None,
             committed: false,
         });
     }
 
     let backend = model::build(&settings)?;
-    build_with(home, options, backend, &settings)
+    build_with(home, options, backend)
 }
 
 /// Refuse to start if the wiki has changes we would mix into our own commit or
 /// destroy. The message names the files, because "uncommitted changes" with no
 /// list is the kind of error that leaves you running `git status` yourself.
 fn preflight(home: &Path, options: &Options) -> Result<()> {
-    if options.into.is_some() || options.dry_run {
+    if options.into.is_some() {
         return Ok(());
     }
     let dirty = git::capture(home, &["status", "--porcelain", "--", "wiki"])?;
@@ -160,10 +148,6 @@ fn pending_events(home: &Path, options: &Options) -> Result<Vec<Event>> {
         Some(id) => log.since(id)?,
         None => log.events()?,
     };
-    if let Some(limit) = &options.to {
-        let resolved = log.resolve_prefix(limit)?;
-        events.retain(|event| event.id <= resolved.id);
-    }
     // A redacted event has no text to fold.
     events.retain(|event| !event.is_redacted());
     Ok(events)
@@ -175,7 +159,6 @@ pub fn build_with(
     home: &Path,
     options: Options,
     backend: std::sync::Arc<dyn Backend>,
-    settings: &model::ModelSettings,
 ) -> Result<Report> {
     let target_is_default = options.into.is_none();
     preflight(home, &options)?;
@@ -189,7 +172,6 @@ pub fn build_with(
         return Ok(Report {
             events: 0,
             outcome: None,
-            run_dir: None,
             committed: false,
         });
     }
@@ -201,14 +183,18 @@ pub fn build_with(
     let mut workspace = Workspace::new(&wiki)?;
     workspace.writable = true;
 
-    let mut reconciler = Reconciler::new(backend.clone());
-    reconciler.max_turns = options.max_turns;
-    reconciler.reporter = std::sync::Arc::new(crate::progress::Reporter::new(options.verbosity));
+    let reporter = std::sync::Arc::new(crate::progress::Reporter::new());
+    let mut agent = Agent::new(backend.clone(), BUILD);
+    agent.reporter = reporter.clone();
 
     let started = chrono::Local::now();
-    let result = reconciler
-        .run(workspace, &events)
-        .map(|(outcome, _)| outcome);
+    reporter.started(events.len(), &agent.actor());
+    let opening = crate::prompts::build_opening(
+        &events,
+        &agent.actor(),
+        &started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    );
+    let result = agent.run(workspace, &opening).map(|(outcome, _)| outcome);
 
     // A rebuild clears the wiki before the agent runs, so a failure would
     // otherwise leave it empty — the pages are recoverable from git, but only
@@ -224,43 +210,20 @@ pub fn build_with(
         }
     }
 
-    // Write the run log whether or not the agent succeeded: a failed run is
-    // exactly when the transcript is most useful.
-    let run_dir = write_run_log(home, &started, &events, &result, backend.as_ref(), settings)
-        .unwrap_or_else(|error| {
-            eprintln!("warning: could not write run log: {error:#}");
-            None
-        });
-
     let outcome = result?;
 
-    // Deterministic, so it runs after the agent rather than being left to it:
-    // the index is mechanical, and a model would only introduce drift (S41).
-    // Also restores the file that `rebuild` cleared.
+    // The index is a mechanical listing of frontmatter that already exists, so
+    // it is generated rather than left to the model.
     let indexed = crate::index::write(&wiki).context("could not write wiki/index.md")?;
-    if indexed > 0 || options.rebuild {
-        reporter_note(&options, &format!("index.md lists {indexed} pages"));
-    }
+    reporter.note(&format!("index.md lists {indexed} pages"));
 
     // Reported, not fatal: the wiki is more useful with a few broken links than
     // not written at all, and the agent may simply not have made a page yet.
     for dangling in crate::index::dangling_links(&wiki)? {
-        reporter_note(
-            &options,
-            &format!(
-                "warning: {} links to {}, which does not exist",
-                dangling.from, dangling.to
-            ),
-        );
-    }
-
-    if options.dry_run {
-        return Ok(Report {
-            events: events.len(),
-            outcome: Some(outcome),
-            run_dir,
-            committed: false,
-        });
+        reporter.warn(&format!(
+            "warning: {} links to {}, which does not exist",
+            dangling.from, dangling.to
+        ));
     }
 
     let last = events.last().expect("events is non-empty").id.clone();
@@ -271,7 +234,6 @@ pub fn build_with(
         return Ok(Report {
             events: events.len(),
             outcome: Some(outcome),
-            run_dir,
             committed: false,
         });
     }
@@ -295,24 +257,23 @@ pub fn build_with(
         "wiki: fold {} event{} ({range})\n\n{}",
         events.len(),
         if events.len() == 1 { "" } else { "s" },
-        outcome.summary
+        outcome.result
     );
 
-    // One commit covering wiki, cursor and the log events being folded, so the
-    // repo never records a wiki that claims to reflect events it hasn't seen.
-    git::commit(home, &["wiki", "state/cursor.json", "log"], &message)?;
+    // Wiki and cursor in one commit, so the repo never records a wiki claiming
+    // to reflect events it hasn't seen.
+    git::commit(home, &["wiki", "state/cursor.json"], &message)?;
 
     Ok(Report {
         events: events.len(),
         outcome: Some(outcome),
-        run_dir,
         committed: true,
     })
 }
 
 /// Remove every page, so a rebuild starts from nothing.
 fn clear_markdown(wiki: &Path) -> Result<()> {
-    for entry in walkdir(wiki)? {
+    for entry in crate::okf::pages(wiki)? {
         if entry.extension().and_then(|e| e.to_str()) == Some("md") {
             std::fs::remove_file(entry)?;
         }
@@ -320,84 +281,6 @@ fn clear_markdown(wiki: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A one-off note at the end of a build, respecting -q.
-fn reporter_note(options: &Options, text: &str) {
-    if options.verbosity != crate::progress::Verbosity::Quiet {
-        eprintln!("  {text}");
-    }
-}
-
-fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            found.extend(walkdir(&path)?);
-        } else {
-            found.push(path);
-        }
-    }
-    Ok(found)
-}
-
-fn write_run_log(
-    home: &Path,
-    started: &chrono::DateTime<chrono::Local>,
-    events: &[Event],
-    result: &Result<Outcome>,
-    backend: &dyn Backend,
-    settings: &model::ModelSettings,
-) -> Result<Option<PathBuf>> {
-    let dir = home
-        .join("state/runs")
-        .join(started.format("%Y%m%dT%H%M%S").to_string());
-    std::fs::create_dir_all(&dir)?;
-
-    let mut report = String::new();
-    report.push_str(&format!("# build {}\n\n", started.to_rfc3339()));
-    report.push_str(&format!(
-        "actor: {}\nprovider: {}\nmodel: {}\n\n",
-        backend.actor(),
-        settings.provider,
-        settings.name
-    ));
-
-    report.push_str(&format!("## events ({})\n\n", events.len()));
-    for event in events {
-        report.push_str(&format!("- {} {} {:?}\n", event.id, event.ts, event.text()));
-    }
-
-    match result {
-        Ok(outcome) => {
-            report.push_str(&format!(
-                "\n## outcome\n\nturns: {}\ninput tokens: {:?}\noutput tokens: {:?}\n\n{}\n",
-                outcome.turns,
-                outcome.usage.input_tokens,
-                outcome.usage.output_tokens,
-                outcome.summary
-            ));
-            report.push_str(&format!(
-                "\n## pages written\n\n{}\n",
-                if outcome.journal.writes.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    outcome.journal.writes.join("\n")
-                }
-            ));
-            report.push_str("\n## transcript\n\n");
-            for line in &outcome.transcript {
-                report.push_str(&format!("{line}\n"));
-            }
-        }
-        Err(error) => {
-            report.push_str(&format!("\n## FAILED\n\n{error:#}\n"));
-        }
-    }
-
-    std::fs::write(dir.join("run.md"), report)?;
-    std::fs::write(dir.join("system-prompt.md"), crate::reconcile::SYSTEM)?;
-    Ok(Some(dir))
-}
 
 #[cfg(test)]
 mod tests {
@@ -452,55 +335,7 @@ mod integration {
         dir
     }
 
-    fn settings() -> model::ModelSettings {
-        model::ModelSettings::default()
-    }
 
-    /// Not an assertion so much as a way to eyeball the live output:
-    /// `cargo test -- --nocapture progress_output`
-    #[test]
-    fn progress_output_is_visible() {
-        let dir = repo();
-        let home = dir.path();
-        Log::open(home)
-            .unwrap()
-            .append("Actually I prefer apples over oranges now".into())
-            .unwrap();
-        std::fs::write(
-            home.join("wiki/food.md"),
-            "---\ntype: Preference\n---\n\nOranges are the favourite.\n",
-        )
-        .unwrap();
-        crate::git::commit(home, &["wiki"], "seed").unwrap();
-
-        let backend = ScriptedBackend::new(vec![
-            ScriptedBackend::tool_call("search_wiki", serde_json::json!({"query": "oranges"})),
-            ScriptedBackend::tool_call("read_page", serde_json::json!({"path": "/food.md"})),
-            ScriptedBackend::tool_call(
-                "write_page",
-                serde_json::json!({"path": "/food.md", "content": "bad content"}),
-            ),
-            ScriptedBackend::tool_call(
-                "write_page",
-                serde_json::json!({
-                    "path": "/food.md",
-                    "content": "---\ntype: Preference\n---\n\nPrefers apples (since Aug 2026); previously oranges.\n"
-                }),
-            ),
-            ScriptedBackend::tool_call(
-                "finish",
-                serde_json::json!({"summary": "Updated fruit preference to apples, noting the change."}),
-            ),
-        ]);
-        let options = Options {
-            verbosity: match std::env::var("LW_TEST_VERBOSE") {
-                Ok(_) => crate::progress::Verbosity::Verbose,
-                Err(_) => crate::progress::Verbosity::Normal,
-            },
-            ..Options::default()
-        };
-        build_with(home, options, backend, &settings()).unwrap();
-    }
 
     #[test]
     fn folds_events_advances_cursor_and_commits() {
@@ -513,7 +348,7 @@ mod integration {
             "/opinions/food.md",
             "---\ntype: Preference\n---\n\nPrefers oranges.\n",
         );
-        let report = build_with(home, Options::default(), backend, &settings()).unwrap();
+        let report = build_with(home, Options::default(), backend).unwrap();
 
         assert_eq!(report.events, 1);
         assert!(report.committed);
@@ -523,16 +358,12 @@ mod integration {
         let cursor = Cursor::load(home).unwrap();
         assert_eq!(cursor.last_event.as_deref(), Some(first.id.as_str()));
 
-        // The commit covers wiki, cursor and log together, so the repo never
-        // records a wiki claiming to reflect events it hasn't seen.
+        // Wiki and cursor move together, so the repo never records a wiki
+        // claiming to reflect events it hasn't seen.
         let files =
             crate::git::capture(home, &["show", "--name-only", "--format=", "HEAD"]).unwrap();
         assert!(files.contains("wiki/opinions/food.md"), "{files}");
         assert!(files.contains("state/cursor.json"), "{files}");
-        assert!(files.contains("log/"), "{files}");
-
-        // And a run log exists for auditing.
-        assert!(report.run_dir.unwrap().join("run.md").exists());
     }
 
     #[test]
@@ -542,12 +373,12 @@ mod integration {
         Log::open(home).unwrap().append("something".into()).unwrap();
 
         let backend = write_and_finish("/a.md", "---\ntype: Reference\n---\n\nSomething.\n");
-        build_with(home, Options::default(), backend, &settings()).unwrap();
+        build_with(home, Options::default(), backend).unwrap();
         let head = crate::git::capture(home, &["rev-parse", "HEAD"]).unwrap();
 
         // An exhausted script would error if the agent ran at all.
         let empty = ScriptedBackend::new(vec![]);
-        let report = build_with(home, Options::default(), empty, &settings()).unwrap();
+        let report = build_with(home, Options::default(), empty).unwrap();
 
         assert_eq!(report.events, 0);
         assert!(!report.committed);
@@ -565,11 +396,11 @@ mod integration {
         log.append("first".into()).unwrap();
 
         let backend = write_and_finish("/a.md", "---\ntype: Reference\n---\n\nFirst.\n");
-        build_with(home, Options::default(), backend, &settings()).unwrap();
+        build_with(home, Options::default(), backend).unwrap();
 
         let second = log.append("second".into()).unwrap();
         let backend = write_and_finish("/b.md", "---\ntype: Reference\n---\n\nSecond.\n");
-        let report = build_with(home, Options::default(), backend, &settings()).unwrap();
+        let report = build_with(home, Options::default(), backend).unwrap();
 
         assert_eq!(report.events, 1, "only the new event should be folded");
         assert_eq!(
@@ -579,7 +410,7 @@ mod integration {
     }
 
     #[test]
-    fn a_failed_run_leaves_the_cursor_alone_and_still_logs() {
+    fn a_failed_run_leaves_the_cursor_alone() {
         let dir = repo();
         let home = dir.path();
         Log::open(home).unwrap().append("something".into()).unwrap();
@@ -590,24 +421,12 @@ mod integration {
                 .map(|_| ScriptedBackend::tool_call("list_pages", serde_json::json!({})))
                 .collect(),
         );
-        let options = Options {
-            max_turns: 2,
-            ..Options::default()
-        };
-        assert!(build_with(home, options, backend, &settings()).is_err());
+        assert!(build_with(home, Options::default(), backend).is_err());
 
         assert!(
             Cursor::load(home).unwrap().last_event.is_none(),
             "cursor must not advance past a failed build"
         );
-        // The transcript of a failed run is exactly when it's most useful.
-        let runs: Vec<_> = std::fs::read_dir(home.join("state/runs"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(runs.len(), 1);
-        let report = std::fs::read_to_string(runs[0].path().join("run.md")).unwrap();
-        assert!(report.contains("FAILED"), "{report}");
     }
 
     /// A rebuild clears the wiki before the agent runs, so a mid-run failure
@@ -631,7 +450,7 @@ mod integration {
             rebuild: true,
             ..Options::default()
         };
-        assert!(build_with(home, options, backend, &settings()).is_err());
+        assert!(build_with(home, options, backend).is_err());
 
         assert!(
             home.join("wiki/people/ada.md").exists(),
@@ -654,33 +473,12 @@ mod integration {
         std::fs::write(home.join("wiki/scratch.md"), "uncommitted\n").unwrap();
 
         let backend = ScriptedBackend::new(vec![]);
-        let error = build_with(home, Options::default(), backend, &settings())
+        let error = build_with(home, Options::default(), backend)
             .unwrap_err()
             .to_string();
         assert!(error.contains("uncommitted"), "{error}");
     }
 
-    #[test]
-    fn dry_run_does_not_commit_or_advance_the_cursor() {
-        let dir = repo();
-        let home = dir.path();
-        Log::open(home).unwrap().append("something".into()).unwrap();
-        let head = crate::git::capture(home, &["rev-parse", "HEAD"]).unwrap();
-
-        let backend = write_and_finish("/a.md", "---\ntype: Reference\n---\n\nSomething.\n");
-        let options = Options {
-            dry_run: true,
-            ..Options::default()
-        };
-        let report = build_with(home, options, backend, &settings()).unwrap();
-
-        assert!(!report.committed);
-        assert!(Cursor::load(home).unwrap().last_event.is_none());
-        assert_eq!(
-            head,
-            crate::git::capture(home, &["rev-parse", "HEAD"]).unwrap()
-        );
-    }
 
     #[test]
     fn into_builds_elsewhere_and_leaves_the_repo_untouched() {
@@ -695,7 +493,7 @@ mod integration {
             into: Some(scratch.path().to_path_buf()),
             ..Options::default()
         };
-        let report = build_with(home, options, backend, &settings()).unwrap();
+        let report = build_with(home, options, backend).unwrap();
 
         assert!(scratch.path().join("a.md").exists());
         assert!(!home.join("wiki/a.md").exists());
@@ -707,22 +505,6 @@ mod integration {
         );
     }
 
-    #[test]
-    fn to_bounds_the_replay() {
-        let dir = repo();
-        let home = dir.path();
-        let log = Log::open(home).unwrap();
-        let first = log.append("first".into()).unwrap();
-        log.append("second".into()).unwrap();
-
-        let backend = write_and_finish("/a.md", "---\ntype: Reference\n---\n\nFirst only.\n");
-        let options = Options {
-            to: Some(first.id.clone()),
-            ..Options::default()
-        };
-        let report = build_with(home, options, backend, &settings()).unwrap();
-        assert_eq!(report.events, 1);
-    }
 
     #[test]
     fn redacted_events_are_skipped() {
@@ -733,7 +515,7 @@ mod integration {
         log.redact(&secret.id, "password").unwrap();
 
         let empty = ScriptedBackend::new(vec![]);
-        let report = build_with(home, Options::default(), empty, &settings()).unwrap();
+        let report = build_with(home, Options::default(), empty).unwrap();
         assert_eq!(report.events, 0, "a redacted event has no text to fold");
     }
 }

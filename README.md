@@ -74,9 +74,8 @@ Capture and read the log — fast, offline, no model:
 | `lw log [-n N]` | Recent entries, newest first. |
 | `lw show <id>` | One entry in full. Ids abbreviate like git hashes. |
 | `lw search <regex>` | Search what you wrote. |
-| `lw status` | How far the wiki lags, and what isn't backed up yet. |
-| `lw sync` | Commit and push the log without building. Cron-safe. |
-| `lw doctor` | Check the log for damage. |
+| `lw status` | How far the wiki lags, and which models are configured. |
+| `lw doctor` | Check the log and wiki for damage. |
 | `lw redact <id> --reason <why>` | Erase one entry's text. See below. |
 
 Build and query the wiki — needs a model, costs money, takes time:
@@ -86,6 +85,9 @@ Build and query the wiki — needs a model, costs money, takes time:
 | `lw build` | Fold new entries into the wiki. |
 | `lw rebuild --force` | Discard the wiki and derive it again from the whole log. |
 | `lw ask <question>` | Answer a question from the wiki. Read-only. |
+
+Entries are committed to git as soon as they are added, so nothing waits for a
+build to be backed up.
 
 `lw <command> --help` explains any of them. `add`, `log`, `search`, `build`,
 `rebuild` and `ask` have short aliases (`a`, `ls`, `s`, `b`, `rb`, `q`).
@@ -123,17 +125,16 @@ folding 2 events with lifewiki/claude-opus-5
   ✓ Updated Ada's page: she has moved from Lisbon to Porto.
 ```
 
-`-v` adds the model's reasoning and untruncated output; `-q` prints only the
-summary. Full transcripts land in `state/runs/`.
+`lw ask` is quiet by default, since its answer is the output; `-v` shows it
+searching and reading.
 
 ### Iterating on the prompt
 
 Because the wiki is derived, improving the pipeline means re-deriving the past.
-`--into` builds elsewhere so a run can't touch the real wiki, and `--to` bounds
-it at an entry so results stay comparable as the log grows:
+`--into` builds elsewhere so a run can't touch the real wiki:
 
 ```sh
-lw rebuild --into /tmp/wiki-v2 --to 01KZYX8F
+lw rebuild --into /tmp/wiki-v2
 diff -r wiki /tmp/wiki-v2
 ```
 
@@ -161,37 +162,21 @@ lifewiki/local-…`), so mixed-provenance wikis stay auditable.
 
 ## Configuring models
 
-`[model]` applies to everything; per-task sub-tables override it. The tasks
-differ: reconciliation rewrites files over a long run and rewards a stronger
-model, while answering is short, frequent and read-only.
+Each task has its own model, because they want different things: reconciliation
+rewrites files over a long run and rewards a stronger model, while answering is
+short, frequent and read-only.
 
 ```toml
-[model]
+[build]
 provider = "anthropic"        # anthropic | local | none
-name = "claude-sonnet-4-5"
-timeout_seconds = 120
+name = "claude-opus-5"
 
-[model.build]
-name = "claude-opus-5"        # spend more where files get rewritten
-
-[model.ask]
+[ask]
 provider = "local"            # questions never leave the machine
 ```
 
-A `name` is inherited only when the task keeps the same provider — a model name
-means nothing to a provider it wasn't written for. To pin a local model, set
-`name` inside `[model.ask]` alongside `provider`.
-
-`lw status` prints what each task resolved to, so a mistyped table is obvious
-without spending a model call:
-
-```
-$ lw status
-Model (build): anthropic/claude-opus-5
-Model (ask):   local (default model)
-```
-
-`--local` on either command overrides the config for that run.
+Omit `name` for the provider's own default. `lw status` prints what each task
+resolved to. `--local` on either command overrides the config for that run.
 
 ## What's stored
 
@@ -201,13 +186,11 @@ Model (ask):   local (default model)
   log/2026-08.jsonl    one file per month, one entry per line, append-only
   wiki/                the generated wiki (an OKF bundle)
   state/cursor.json    how far the wiki has been folded
-  state/runs/          build transcripts (gitignored)
 ```
 
-One git repository holds both log and wiki. A single `push` backs up the one
-thing that can't be regenerated, and each build is one commit covering wiki,
-cursor and log together — so `git revert` of that commit undoes a build
-completely.
+One git repository holds both log and wiki. Adding an entry commits it
+immediately; each build is one commit covering wiki and cursor together, so
+`git revert` of that commit undoes a build completely.
 
 Plain files throughout, no database. A heavy year of entries is a few megabytes,
 so the log is parsed on every read.
@@ -243,6 +226,8 @@ Known gaps:
   context.
 - **No `index.md` in subdirectories.** Only the bundle root gets one, though OKF
   permits them at any level.
+- **No transcripts.** Runs narrate themselves as they go, but nothing is kept
+  afterwards; a build's commit message is the durable record.
 
 ## Documentation
 

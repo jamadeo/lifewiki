@@ -21,13 +21,10 @@ pub const FILENAME: &str = "index.md";
 pub fn generate(wiki: &Path) -> Result<String> {
     let mut sections: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
 
-    for path in markdown_files(wiki)? {
-        let relative = path
-            .strip_prefix(wiki)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        // The index does not list itself.
+    for path in okf::pages(wiki)? {
+        let relative = okf::bundle_path(wiki, &path)
+            .trim_start_matches('/')
+            .to_string();
         if relative == FILENAME {
             continue;
         }
@@ -111,31 +108,6 @@ fn stem(relative: &str) -> String {
         .replace(['-', '_'], " ")
 }
 
-fn markdown_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let mut found = Vec::new();
-    if !dir.is_dir() {
-        return Ok(found);
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        // Editor and tool state, not content.
-        if name.starts_with('.') {
-            continue;
-        }
-        if path.is_dir() {
-            found.extend(markdown_files(&path)?);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
-            found.push(path);
-        }
-    }
-    found.sort();
-    Ok(found)
-}
 
 #[cfg(test)]
 mod tests {
@@ -243,29 +215,15 @@ pub struct Dangling {
 /// check would reject correct work. That means dangling links are reported, not
 /// prevented — the tradeoff is deliberate.
 pub fn dangling_links(wiki: &Path) -> Result<Vec<Dangling>> {
-    let files = markdown_files(wiki)?;
+    let files = okf::pages(wiki)?;
     let existing: std::collections::HashSet<String> = files
         .iter()
-        .map(|path| {
-            format!(
-                "/{}",
-                path.strip_prefix(wiki)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            )
-        })
+        .map(|path| okf::bundle_path(wiki, path))
         .collect();
 
     let mut dangling = Vec::new();
     for path in &files {
-        let from = format!(
-            "/{}",
-            path.strip_prefix(wiki)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/")
-        );
+        let from = okf::bundle_path(wiki, path);
         let raw = std::fs::read_to_string(path)?;
         let body = match okf::parse(&raw) {
             Ok(page) => page.body,

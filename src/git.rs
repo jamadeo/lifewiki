@@ -1,4 +1,4 @@
-//! Git operations, done by shelling out to the `git` binary (S8).
+//! Git operations, done by shelling out to the `git` binary.
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;

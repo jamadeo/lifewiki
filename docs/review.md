@@ -183,3 +183,27 @@ worst offenders were **copying `reconcile.rs` to make `ask.rs`** (a shortcut tha
 should not have survived the commit), **three verbosity levels** where one bool
 was requested, and **`lw sync`** — a command that exists only to compensate for
 an earlier decision, which is the clearest sign a design has gone slightly wrong.
+
+
+---
+
+## Outcome
+
+Executed. 5,267 → 4,254 lines of Rust, a 19% cut, with 63 tests still passing
+and the CLI down from 12 commands to 11 and from 20 flags to 11.
+
+| change | result |
+|--------|--------|
+| One `agent.rs` for both tasks | 1,091 → 485 lines, plus `prompts.rs` (146) holding the parts that differ |
+| Commit on `add`; drop `sync` | the working tree is never a place unbacked-up data lives |
+| Flat `[build]` / `[ask]` config | inheritance and its provider-matching rule gone |
+| One `Reporter`, no verbosity levels | 192 → 167 lines, no mutex |
+| One walker in `okf::pages` | three copies gone, and the one that did not skip dotfiles with them |
+| Dropped `--to`, `--dry-run`, `--repair`, `state/runs/` | ~120 lines |
+
+Splitting `app.rs` per command was skipped: it moves lines without removing any,
+and at 612 lines it is legible. Worth revisiting if it grows.
+
+The prompts moving to their own module was not in the original plan but fell out
+of the merge — they are the part that determines quality and are edited far more
+often than the loop around them, so the separation is worth having on its own.

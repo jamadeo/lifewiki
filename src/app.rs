@@ -36,6 +36,9 @@ enum CommandName {
 
     /// Record something in the log.
     ///
+    /// Committed to git immediately, so an entry is backed up as soon as it
+    /// exists.
+    ///
     /// The text is stored verbatim and never edited afterwards. Write in plain
     /// prose; there are no tags, types or categories to choose. To correct or
     /// update something, just say so in a new entry — the wiki build works out
@@ -83,19 +86,8 @@ enum CommandName {
         query: String,
     },
 
-    /// Show how far the wiki lags the log, and what is not yet backed up.
-    ///
-    /// Reports the last build, how many entries are waiting to be folded, and
-    /// whether any entries exist only in the working tree. Uncommitted entries
-    /// survive a crash but not a lost machine, so a warning after 24 hours
-    /// suggests running `lw sync`.
+    /// Show how far the wiki lags the log, and which models are configured.
     Status,
-
-    /// Commit and push the log without building the wiki.
-    ///
-    /// Cheap and model-free, so it is safe to run from cron. Use it to get
-    /// recent entries backed up off-machine between builds.
-    Sync,
 
     /// Check the log and wiki for damage.
     ///
@@ -107,15 +99,8 @@ enum CommandName {
     /// links resolve. Pages are validated when written, but a hand-edit or a
     /// deleted page can break them afterwards.
     ///
-    /// Reports problems without changing anything unless --repair is given.
-    Doctor {
-        /// Quarantine damaged lines instead of only reporting them.
-        ///
-        /// This is the only command besides `redact` that modifies the log, so
-        /// it is deliberately opt-in. Read the report first.
-        #[arg(long)]
-        repair: bool,
-    },
+    /// Reports problems; it never changes anything.
+    Doctor,
 
     /// Permanently erase the text of one entry.
     ///
@@ -156,28 +141,10 @@ enum CommandName {
         /// versions can be built and compared with `diff -r`.
         #[arg(long, value_name = "DIR")]
         into: Option<PathBuf>,
-        /// Stop after this entry, so a run stays reproducible as the log grows.
-        #[arg(long, value_name = "ID")]
-        to: Option<String>,
-        /// Run the agent, then leave the changes uncommitted.
-        ///
-        /// Pages are still written to the working tree so you can inspect
-        /// them; discard with `git checkout -- wiki/`.
-        #[arg(long)]
-        dry_run: bool,
-        /// Give up after this many agent turns.
-        #[arg(long, default_value_t = crate::reconcile::DEFAULT_MAX_TURNS, value_name = "N")]
-        max_turns: usize,
         /// Run inference locally instead of using the configured provider.
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
-        /// Also show the model's reasoning and untruncated tool output.
-        #[arg(short, long)]
-        verbose: bool,
-        /// Print only the final summary.
-        #[arg(short, long, conflicts_with = "verbose")]
-        quiet: bool,
     },
 
     /// Ask a question about your life, answered from the wiki.
@@ -194,14 +161,11 @@ enum CommandName {
         /// The question. Quoting is optional.
         #[arg(trailing_var_arg = true, value_name = "QUESTION")]
         question: Vec<String>,
-        /// Give up after this many agent turns.
-        #[arg(long, default_value_t = crate::ask::DEFAULT_MAX_TURNS, value_name = "N")]
-        max_turns: usize,
         /// Run inference locally instead of using the configured provider.
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
-        /// Show the search and reading as it happens.
+        /// Show the searching and reading as it happens.
         #[arg(short, long)]
         verbose: bool,
     },
@@ -219,12 +183,6 @@ enum CommandName {
         /// Build into this directory instead, leaving the real wiki alone.
         #[arg(long, value_name = "DIR")]
         into: Option<PathBuf>,
-        /// Stop after this entry, so a run stays reproducible as the log grows.
-        #[arg(long, value_name = "ID")]
-        to: Option<String>,
-        /// Give up after this many agent turns.
-        #[arg(long, default_value_t = crate::reconcile::DEFAULT_MAX_TURNS, value_name = "N")]
-        max_turns: usize,
         /// Confirm discarding the current wiki. Required unless --into is given.
         #[arg(long)]
         force: bool,
@@ -232,12 +190,6 @@ enum CommandName {
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
-        /// Also show the model's reasoning and untruncated tool output.
-        #[arg(short, long)]
-        verbose: bool,
-        /// Print only the final summary.
-        #[arg(short, long, conflicts_with = "verbose")]
-        quiet: bool,
     },
 }
 
@@ -250,6 +202,9 @@ pub fn run() -> Result<()> {
             paths::require_initialized(&home)?;
             let text = capture_text(text)?;
             let event = Log::open(&home)?.append(text)?;
+            // Commit immediately: an entry that exists only in the working tree
+            // survives a crash but not a lost machine.
+            crate::git::commit(&home, &["log"], &format!("log: {}", event.one_line()))?;
             println!("{}", event.id);
             Ok(())
         }
@@ -287,31 +242,21 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         CommandName::Status => status(&home),
-        CommandName::Sync => sync(&home),
-        CommandName::Doctor { repair } => {
+        CommandName::Doctor => {
             paths::require_initialized(&home)?;
-            doctor(&home, repair)
+            doctor(&home)
         }
         CommandName::Build {
             into,
-            to,
-            dry_run,
-            max_turns,
             #[cfg(feature = "local")]
             local,
-            verbose,
-            quiet,
         } => {
             paths::require_initialized(&home)?;
             run_build(
                 &home,
                 crate::build::Options {
                     into,
-                    to,
                     rebuild: false,
-                    dry_run,
-                    max_turns,
-                    verbosity: verbosity(verbose, quiet),
                     #[cfg(feature = "local")]
                     provider_override: local.then(|| "local".to_string()),
                     #[cfg(not(feature = "local"))]
@@ -321,7 +266,6 @@ pub fn run() -> Result<()> {
         }
         CommandName::Ask {
             question,
-            max_turns,
             #[cfg(feature = "local")]
             local,
             verbose,
@@ -331,17 +275,13 @@ pub fn run() -> Result<()> {
             let provider_override = local.then(|| "local".to_string());
             #[cfg(not(feature = "local"))]
             let provider_override: Option<String> = None;
-            ask(&home, question, max_turns, provider_override, verbose)
+            ask(&home, question, provider_override, verbose)
         }
         CommandName::Rebuild {
             into,
-            to,
-            max_turns,
             force,
             #[cfg(feature = "local")]
             local,
-            verbose,
-            quiet,
         } => {
             paths::require_initialized(&home)?;
             if into.is_none() && !force {
@@ -354,11 +294,7 @@ pub fn run() -> Result<()> {
                 &home,
                 crate::build::Options {
                     into,
-                    to,
                     rebuild: true,
-                    dry_run: false,
-                    max_turns,
-                    verbosity: verbosity(verbose, quiet),
                     #[cfg(feature = "local")]
                     provider_override: local.then(|| "local".to_string()),
                     #[cfg(not(feature = "local"))]
@@ -377,35 +313,29 @@ pub fn run() -> Result<()> {
 
 fn init(home: &Path) -> Result<()> {
     fs::create_dir_all(home.join("log"))?;
-    fs::create_dir_all(home.join("state/runs"))?;
     fs::create_dir_all(home.join("wiki"))?;
     if !home.join("config.toml").exists() {
         fs::write(
             home.join("config.toml"),
             concat!(
                 "# lifewiki configuration\n",
-                "# pending_warning_hours = 24\n",
-                "\n",
-                "# Model settings. [model] applies to everything; the sub-tables\n",
-                "# override it per task. Reconciliation rewrites files over a long\n",
-                "# run and rewards a stronger model; answering is short, frequent\n",
-                "# and read-only, so it is the place to spend less.\n",
+                "#\n",
+                "# Each task has its own model. Reconciliation rewrites files over\n",
+                "# a long run and rewards a stronger model; answering is short and\n",
+                "# read-only, so it is the place to spend less, or to keep local.\n",
                 "#\n",
                 "# provider: anthropic | local | none\n",
                 "#   `local` runs offline and needs a binary built with\n",
                 "#   --features local (or metal/cuda/vulkan).\n",
-                "# name: omit to use the provider's own default.\n",
+                "# name: omit for the provider's own default.\n",
                 "\n",
-                "[model]\n",
+                "[build]\n",
                 "provider = \"anthropic\"\n",
                 "name = \"claude-sonnet-4-5\"\n",
-                "timeout_seconds = 120\n",
                 "\n",
-                "# [model.build]\n",
-                "# name = \"claude-opus-5\"\n",
-                "\n",
-                "# [model.ask]\n",
-                "# provider = \"local\"\n",
+                "[ask]\n",
+                "provider = \"anthropic\"\n",
+                "name = \"claude-sonnet-4-5\"\n",
             ),
         )?;
     }
@@ -428,10 +358,6 @@ fn init(home: &Path) -> Result<()> {
 const GITIGNORE: &str = "\
 # Transient: the append lock.
 .lock
-
-# Build transcripts. Useful locally, but noisy in history and regenerated
-# on every run; the wiki commit already records what changed.
-state/runs/
 
 # Editor and viewer state. Obsidian writes wiki/.obsidian when a vault is
 # opened, which is not part of the wiki's content.
@@ -503,26 +429,6 @@ fn status(home: &Path) -> Result<()> {
         if unfolded.len() == 1 { "" } else { "s" }
     );
 
-    // Uncommitted log events exist only in the working tree, so they are not
-    // backed up by a push (S12).
-    let uncommitted = crate::git::capture(home, &["status", "--porcelain", "--", "log"])?;
-    if !uncommitted.trim().is_empty() {
-        let pending = log.events()?;
-        let oldest = pending
-            .iter()
-            .rev()
-            .filter_map(|event| chrono::DateTime::parse_from_rfc3339(&event.ts).ok())
-            .last();
-        print!("Log has uncommitted events");
-        if let Some(oldest) = oldest {
-            let age = chrono::Local::now().signed_duration_since(oldest);
-            print!(" (oldest {} hours old)", age.num_hours());
-            if age.num_hours() >= 24 {
-                print!(" — run `lw sync` to back them up");
-            }
-        }
-        println!();
-    }
 
     if crate::git::is_dirty(home, "wiki")? {
         println!("wiki/ has uncommitted changes; `lw build` will refuse to run");
@@ -531,28 +437,8 @@ fn status(home: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sync(home: &Path) -> Result<()> {
-    paths::require_initialized(home)?;
-    let status = Command::new("git")
-        .args(["status", "--porcelain", "--", "log"])
-        .current_dir(home)
-        .output()?;
-    if status.stdout.is_empty() {
-        println!("No pending log events.");
-        return Ok(());
-    }
-    git(home, &["add", "log"])?;
-    git(home, &["commit", "-m", "log: captured events"])?;
-    let push = Command::new("git").arg("push").current_dir(home).status()?;
-    if !push.success() {
-        bail!("events were committed, but git push failed");
-    }
-    println!("Synced pending log events.");
-    Ok(())
-}
 
 fn run_build(home: &Path, options: crate::build::Options) -> Result<()> {
-    let dry_run = options.dry_run;
     let report = crate::build::build(home, options)?;
 
     if report.events == 0 {
@@ -573,17 +459,11 @@ fn run_build(home: &Path, options: crate::build::Options) -> Result<()> {
                 println!("  {page}");
             }
         }
-        if !outcome.summary.is_empty() {
-            println!("\n{}", outcome.summary);
+        if !outcome.result.is_empty() {
+            println!("\n{}", outcome.result);
         }
     }
-    if let Some(dir) = &report.run_dir {
-        println!("\nRun log: {}", dir.display());
-    }
-    if dry_run {
-        println!("\nDry run: changes were written to the working tree but not committed.");
-        println!("Discard them with `git -C {} checkout -- wiki/`", home.display());
-    } else if !report.committed {
+    if !report.committed {
         println!("\nNot committed.");
     }
     Ok(())
@@ -607,7 +487,6 @@ fn show_models(home: &Path) -> Result<()> {
 fn ask(
     home: &Path,
     question: Vec<String>,
-    max_turns: usize,
     provider_override: Option<String>,
     verbose: bool,
 ) -> Result<()> {
@@ -619,7 +498,7 @@ fn ask(
     let wiki = home.join("wiki");
     // A wiki with only the index has nothing to answer from, and "not in the
     // wiki" would be a misleading answer when the real problem is no build.
-    let pages = walk_markdown(&wiki)?
+    let pages = crate::okf::pages(&wiki)?
         .into_iter()
         .filter(|path| {
             path.file_name().map(|name| name != crate::index::FILENAME).unwrap_or(true)
@@ -638,15 +517,17 @@ fn ask(
     }
     let backend = crate::model::build(&settings)?;
 
-    let mut asker = crate::ask::Asker::new(backend);
-    asker.max_turns = max_turns;
-    asker.reporter = std::sync::Arc::new(crate::progress::Reporter::new(if verbose {
-        crate::progress::Verbosity::Verbose
-    } else {
-        crate::progress::Verbosity::Quiet
-    }));
+    let mut agent = crate::agent::Agent::new(backend, crate::agent::ASK);
+    if verbose {
+        agent.reporter = std::sync::Arc::new(crate::progress::Reporter::new());
+    }
 
-    let answer = asker.ask(home, &wiki, &question).map_err(|error| {
+    let mut workspace = crate::tools::Workspace::new(&wiki)?;
+    workspace.writable = false;
+    workspace.home = Some(home.to_path_buf());
+
+    let opening = crate::prompts::ask_opening(&question);
+    let (outcome, _) = agent.run(workspace, &opening).map_err(|error| {
         // A small local model can spiral rather than concluding a fact is
         // absent, and exhausting the context is how that presents. The raw
         // provider message doesn't hint at the actual cause.
@@ -664,24 +545,24 @@ fn ask(
             error
         }
     })?;
-    println!("{}", answer.text.trim());
+    println!("{}", outcome.result.trim());
     if verbose {
-        if !answer.pages_read.is_empty() {
-            eprintln!("\nRead: {}", answer.pages_read.join(", "));
+        if !outcome.journal.reads.is_empty() {
+            eprintln!("\nRead: {}", outcome.journal.reads.join(", "));
         }
         eprintln!(
             "{} turn{}, {} in / {} out tokens",
-            answer.turns,
-            if answer.turns == 1 { "" } else { "s" },
-            answer.usage.input_tokens.unwrap_or(0),
-            answer.usage.output_tokens.unwrap_or(0)
+            outcome.turns,
+            if outcome.turns == 1 { "" } else { "s" },
+            outcome.usage.input_tokens.unwrap_or(0),
+            outcome.usage.output_tokens.unwrap_or(0)
         );
     }
     Ok(())
 }
 
-fn doctor(home: &Path, repair: bool) -> Result<()> {
-    let mut problems = Log::open(home)?.check(repair)?;
+fn doctor(home: &Path) -> Result<()> {
+    let mut problems = Log::open(home)?.check()?;
     if problems.is_empty() {
         println!("log is healthy");
     } else {
@@ -694,7 +575,7 @@ fn doctor(home: &Path, repair: bool) -> Result<()> {
     // break them afterwards, so the same gate runs again here.
     let wiki = home.join("wiki");
     let mut wiki_problems = Vec::new();
-    for path in walk_markdown(&wiki)? {
+    for path in crate::okf::pages(&wiki)? {
         let relative = path.strip_prefix(&wiki).unwrap_or(&path).to_string_lossy();
         if relative == crate::index::FILENAME {
             // The index has no frontmatter by design (OKF SPEC §8).
@@ -721,41 +602,13 @@ fn doctor(home: &Path, repair: bool) -> Result<()> {
     }
 
     problems.extend(wiki_problems);
-    if !problems.is_empty() && !repair {
+    if !problems.is_empty() {
         println!("\n{} problem(s) found.", problems.len());
     }
     Ok(())
 }
 
-fn walk_markdown(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut found = Vec::new();
-    if !dir.is_dir() {
-        return Ok(found);
-    }
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue;
-        }
-        if path.is_dir() {
-            found.extend(walk_markdown(&path)?);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
-            found.push(path);
-        }
-    }
-    found.sort();
-    Ok(found)
-}
 
-fn verbosity(verbose: bool, quiet: bool) -> crate::progress::Verbosity {
-    use crate::progress::Verbosity;
-    match (verbose, quiet) {
-        (true, _) => Verbosity::Verbose,
-        (_, true) => Verbosity::Quiet,
-        _ => Verbosity::Normal,
-    }
-}
 
 #[cfg(test)]
 mod tests {
