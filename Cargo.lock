@@ -2253,6 +2253,7 @@ dependencies = [
  "goose-providers",
  "libc",
  "regex",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",

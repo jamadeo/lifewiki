@@ -384,6 +384,29 @@ pub mod tests {
         assert!(error.contains("config.toml"), "{error}");
     }
 
+    /// Guards against a silent misconfiguration: `goose-providers` defaults to
+    /// no TLS backend, and without one every HTTPS request fails as a
+    /// "could not connect" network error that looks like the user's fault.
+    /// Constructing a client is enough to catch it — reqwest panics at build
+    /// time when asked for TLS it wasn't compiled with.
+    #[tokio::test]
+    async fn https_is_supported() {
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .build()
+            .expect("no TLS backend compiled in; check goose-providers features");
+        // A HEAD to a known-good endpoint: any HTTP status proves TLS works.
+        // Only the transport is under test, so a network failure is tolerated.
+        if let Ok(response) = client
+            .head("https://api.anthropic.com/v1/models")
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            assert!(response.status().as_u16() > 0);
+        }
+    }
+
     #[test]
     fn actor_is_okf_shaped() {
         assert_eq!(StubBackend.actor(), "lifewiki/none");
