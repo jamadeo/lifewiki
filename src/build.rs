@@ -109,16 +109,43 @@ pub fn build(home: &Path, options: Options) -> Result<Report> {
     build_with(home, options, backend, &settings)
 }
 
-/// Refuse to start if the wiki has changes we would mix into our own commit.
+/// Refuse to start if the wiki has changes we would mix into our own commit or
+/// destroy. The message names the files, because "uncommitted changes" with no
+/// list is the kind of error that leaves you running `git status` yourself.
 fn preflight(home: &Path, options: &Options) -> Result<()> {
-    if options.into.is_none() && !options.dry_run && git::is_dirty(home, "wiki")? {
-        bail!(
-            "wiki/ has uncommitted changes; commit or discard them first \
-             (`git -C {} checkout -- wiki/`)",
-            home.display()
+    if options.into.is_some() || options.dry_run {
+        return Ok(());
+    }
+    let dirty = git::capture(home, &["status", "--porcelain", "--", "wiki"])?;
+    if dirty.trim().is_empty() {
+        return Ok(());
+    }
+
+    let files: Vec<&str> = dirty.lines().map(str::trim).collect();
+    let mut message = String::from("wiki/ has uncommitted changes:\n");
+    for file in &files {
+        message.push_str(&format!("  {file}\n"));
+    }
+    message.push_str(&format!(
+        "\nA build rewrites these pages, so it will not run while they differ \
+         from the last commit.\n\n\
+         If the changes are yours and you want to keep them:\n  \
+         git -C {home} add wiki && git -C {home} commit -m 'wiki: manual edits'\n\n\
+         If you want to discard them:\n  \
+         git -C {home} checkout -- wiki/\n",
+        home = home.display()
+    ));
+
+    // An editor opening the wiki is the common cause, and the fix is a
+    // gitignore entry rather than a commit.
+    if files.iter().any(|file| file.contains(".obsidian")) {
+        message.push_str(
+            "\nwiki/.obsidian/ is editor state, not content. `lw init` now ignores \
+             it; add it to .gitignore in this repo:\n  \
+             echo '.obsidian/' >> .gitignore\n",
         );
     }
-    Ok(())
+    bail!("{message}");
 }
 
 /// Events this build would fold, given the cursor and options.
@@ -182,6 +209,20 @@ pub fn build_with(
     let result = reconciler
         .run(workspace, &events)
         .map(|(outcome, _)| outcome);
+
+    // A rebuild clears the wiki before the agent runs, so a failure would
+    // otherwise leave it empty — the pages are recoverable from git, but only
+    // if you know to look. Restore them ourselves instead.
+    if result.is_err() && options.rebuild && target_is_default {
+        match git::run(home, &["checkout", "--", "wiki/"]) {
+            Ok(()) => eprintln!("\nRebuild failed; restored wiki/ from the last commit."),
+            Err(error) => eprintln!(
+                "\nRebuild failed and wiki/ could not be restored: {error:#}\n\
+                 Recover it with: git -C {} checkout -- wiki/",
+                home.display()
+            ),
+        }
+    }
 
     // Write the run log whether or not the agent succeeded: a failed run is
     // exactly when the transcript is most useful.
@@ -540,6 +581,42 @@ mod integration {
         assert_eq!(runs.len(), 1);
         let report = std::fs::read_to_string(runs[0].path().join("run.md")).unwrap();
         assert!(report.contains("FAILED"), "{report}");
+    }
+
+    /// A rebuild clears the wiki before the agent runs, so a mid-run failure
+    /// must not leave the user with an empty wiki.
+    #[test]
+    fn a_failed_rebuild_restores_the_wiki() {
+        let dir = repo();
+        let home = dir.path();
+        Log::open(home).unwrap().append("something".into()).unwrap();
+        std::fs::create_dir_all(home.join("wiki/people")).unwrap();
+        std::fs::write(
+            home.join("wiki/people/ada.md"),
+            "---\ntype: Person\n---\n\nAda.\n",
+        )
+        .unwrap();
+        crate::git::commit(home, &["wiki"], "seed").unwrap();
+
+        // Exhausted script: the agent fails on its first inference.
+        let backend = ScriptedBackend::new(vec![]);
+        let options = Options {
+            rebuild: true,
+            ..Options::default()
+        };
+        assert!(build_with(home, options, backend, &settings()).is_err());
+
+        assert!(
+            home.join("wiki/people/ada.md").exists(),
+            "a failed rebuild left the wiki empty"
+        );
+        assert!(
+            crate::git::capture(home, &["status", "--porcelain", "--", "wiki"])
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "wiki should be back to its committed state"
+        );
     }
 
     #[test]

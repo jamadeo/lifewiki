@@ -242,14 +242,33 @@ fn init(home: &Path) -> Result<()> {
     if !home.join("wiki/index.md").exists() {
         fs::write(home.join("wiki/index.md"), "# lifewiki\n")?;
     }
+    if !home.join(".gitignore").exists() {
+        fs::write(home.join(".gitignore"), GITIGNORE)?;
+    }
     if !home.join(".git").exists() {
         git(home, &["init"])?;
-        git(home, &["add", "config.toml", "wiki"])?;
+        git(home, &["add", ".gitignore", "config.toml", "wiki"])?;
         git(home, &["commit", "-m", "lifewiki: initialize"])?;
     }
     println!("Initialized lifewiki at {}", home.display());
     Ok(())
 }
+/// Untracked files that would otherwise make the tree permanently dirty and
+/// block every build.
+const GITIGNORE: &str = "\
+# Transient: the append lock.
+.lock
+
+# Build transcripts. Useful locally, but noisy in history and regenerated
+# on every run; the wiki commit already records what changed.
+state/runs/
+
+# Editor and viewer state. Obsidian writes wiki/.obsidian when a vault is
+# opened, which is not part of the wiki's content.
+.obsidian/
+.DS_Store
+";
+
 fn capture_text(args: Vec<String>) -> Result<String> {
     if !args.is_empty() {
         return Ok(args.join(" "));
