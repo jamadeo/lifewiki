@@ -57,6 +57,8 @@ pub struct Options {
     pub rebuild: bool,
     /// Override the provider from config.toml, e.g. "local" from `--local`.
     pub provider_override: Option<String>,
+    /// Print only the result, without narrating the run.
+    pub quiet: bool,
 }
 
 impl Default for Options {
@@ -65,6 +67,7 @@ impl Default for Options {
             into: None,
             rebuild: false,
             provider_override: None,
+            quiet: false,
         }
     }
 }
@@ -183,7 +186,11 @@ pub fn build_with(
     let mut workspace = Workspace::new(&wiki)?;
     workspace.writable = true;
 
-    let reporter = std::sync::Arc::new(crate::progress::Reporter::new());
+    let reporter = std::sync::Arc::new(if options.quiet {
+        crate::progress::Reporter::silent()
+    } else {
+        crate::progress::Reporter::new()
+    });
     let mut agent = Agent::new(backend.clone(), BUILD);
     agent.reporter = reporter.clone();
 

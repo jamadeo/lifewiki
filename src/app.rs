@@ -145,6 +145,9 @@ enum CommandName {
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
+        /// Print only the result, without narrating the run.
+        #[arg(short, long)]
+        quiet: bool,
     },
 
     /// Ask a question about your life, answered from the wiki.
@@ -165,9 +168,9 @@ enum CommandName {
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
-        /// Show the searching and reading as it happens.
+        /// Print only the answer, without the searching and reading.
         #[arg(short, long)]
-        verbose: bool,
+        quiet: bool,
     },
 
     /// Discard the wiki and derive it again from the whole log.
@@ -190,6 +193,9 @@ enum CommandName {
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
+        /// Print only the result, without narrating the run.
+        #[arg(short, long)]
+        quiet: bool,
     },
 }
 
@@ -250,6 +256,7 @@ pub fn run() -> Result<()> {
             into,
             #[cfg(feature = "local")]
             local,
+            quiet,
         } => {
             paths::require_initialized(&home)?;
             run_build(
@@ -257,6 +264,7 @@ pub fn run() -> Result<()> {
                 crate::build::Options {
                     into,
                     rebuild: false,
+                    quiet,
                     #[cfg(feature = "local")]
                     provider_override: local.then(|| "local".to_string()),
                     #[cfg(not(feature = "local"))]
@@ -268,20 +276,21 @@ pub fn run() -> Result<()> {
             question,
             #[cfg(feature = "local")]
             local,
-            verbose,
+            quiet,
         } => {
             paths::require_initialized(&home)?;
             #[cfg(feature = "local")]
             let provider_override = local.then(|| "local".to_string());
             #[cfg(not(feature = "local"))]
             let provider_override: Option<String> = None;
-            ask(&home, question, provider_override, verbose)
+            ask(&home, question, provider_override, quiet)
         }
         CommandName::Rebuild {
             into,
             force,
             #[cfg(feature = "local")]
             local,
+            quiet,
         } => {
             paths::require_initialized(&home)?;
             if into.is_none() && !force {
@@ -295,6 +304,7 @@ pub fn run() -> Result<()> {
                 crate::build::Options {
                     into,
                     rebuild: true,
+                    quiet,
                     #[cfg(feature = "local")]
                     provider_override: local.then(|| "local".to_string()),
                     #[cfg(not(feature = "local"))]
@@ -488,7 +498,7 @@ fn ask(
     home: &Path,
     question: Vec<String>,
     provider_override: Option<String>,
-    verbose: bool,
+    quiet: bool,
 ) -> Result<()> {
     let question = capture_text(question)?;
     if question.trim().is_empty() {
@@ -518,7 +528,7 @@ fn ask(
     let backend = crate::model::build(&settings)?;
 
     let mut agent = crate::agent::Agent::new(backend, crate::agent::ASK);
-    if verbose {
+    if !quiet {
         agent.reporter = std::sync::Arc::new(crate::progress::Reporter::new());
     }
 
@@ -546,7 +556,7 @@ fn ask(
         }
     })?;
     println!("{}", outcome.result.trim());
-    if verbose {
+    if !quiet {
         if !outcome.journal.reads.is_empty() {
             eprintln!("\nRead: {}", outcome.journal.reads.join(", "));
         }

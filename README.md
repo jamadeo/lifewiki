@@ -102,7 +102,7 @@ Your children are Rian, born 4 May 2021, and Avi, born 26 August 2023.
 
 Answers come only from the wiki, and it is told to say so when something isn't
 there rather than guess — this is a record of your own life, so a confident wrong
-answer is worse than none. `-v` shows the searching and reading as it happens.
+answer is worse than none.
 
 A question can never modify the wiki: the workspace is opened read-only *and*
 the write tools aren't offered to the model.
@@ -125,8 +125,12 @@ folding 2 events with lifewiki/claude-opus-5
   ✓ Updated Ada's page: she has moved from Lisbon to Porto.
 ```
 
-`lw ask` is quiet by default, since its answer is the output; `-v` shows it
-searching and reading.
+Every command that runs an agent narrates itself this way. `-q` silences the
+narration and prints only the result, which is what you want when piping:
+
+```sh
+lw ask -q "who are my children?" > children.txt
+```
 
 ### Iterating on the prompt
 

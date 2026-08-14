@@ -197,7 +197,7 @@ and the CLI down from 12 commands to 11 and from 20 flags to 11.
 | One `agent.rs` for both tasks | 1,091 → 485 lines, plus `prompts.rs` (146) holding the parts that differ |
 | Commit on `add`; drop `sync` | the working tree is never a place unbacked-up data lives |
 | Flat `[build]` / `[ask]` config | inheritance and its provider-matching rule gone |
-| One `Reporter`, no verbosity levels | 192 → 167 lines, no mutex |
+| One `Reporter`, narrating by default with `-q` to silence it | 192 → 167 lines, no mutex |
 | One walker in `okf::pages` | three copies gone, and the one that did not skip dotfiles with them |
 | Dropped `--to`, `--dry-run`, `--repair`, `state/runs/` | ~120 lines |
 
