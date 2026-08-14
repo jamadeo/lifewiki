@@ -9,7 +9,7 @@
 use crate::event::Event;
 use crate::git;
 use crate::log::Log;
-use crate::model::{self, Model};
+use crate::model::{self, Backend};
 use crate::reconcile::{Outcome, Reconciler};
 use crate::tools::Workspace;
 use anyhow::{bail, Context, Result};
@@ -97,8 +97,8 @@ pub fn build(home: &Path, options: Options) -> Result<Report> {
         });
     }
 
-    let model = model::build(&settings)?;
-    build_with(home, options, model.as_ref(), &settings)
+    let backend = model::build(&settings)?;
+    build_with(home, options, backend, &settings)
 }
 
 /// Refuse to start if the wiki has changes we would mix into our own commit.
@@ -139,7 +139,7 @@ fn pending_events(home: &Path, options: &Options) -> Result<Vec<Event>> {
 pub fn build_with(
     home: &Path,
     options: Options,
-    model: &dyn Model,
+    backend: std::sync::Arc<dyn Backend>,
     settings: &model::ModelSettings,
 ) -> Result<Report> {
     let target_is_default = options.into.is_none();
@@ -166,15 +166,17 @@ pub fn build_with(
     let mut workspace = Workspace::new(&wiki)?;
     workspace.writable = true;
 
-    let mut reconciler = Reconciler::new(model);
+    let mut reconciler = Reconciler::new(backend.clone());
     reconciler.max_turns = options.max_turns;
 
     let started = chrono::Local::now();
-    let result = reconciler.run(&mut workspace, &events);
+    let result = reconciler
+        .run(workspace, &events)
+        .map(|(outcome, _)| outcome);
 
     // Write the run log whether or not the agent succeeded: a failed run is
     // exactly when the transcript is most useful.
-    let run_dir = write_run_log(home, &started, &events, &result, model, settings)
+    let run_dir = write_run_log(home, &started, &events, &result, backend.as_ref(), settings)
         .unwrap_or_else(|error| {
             eprintln!("warning: could not write run log: {error:#}");
             None
@@ -266,7 +268,7 @@ fn write_run_log(
     started: &chrono::DateTime<chrono::Local>,
     events: &[Event],
     result: &Result<Outcome>,
-    model: &dyn Model,
+    backend: &dyn Backend,
     settings: &model::ModelSettings,
 ) -> Result<Option<PathBuf>> {
     let dir = home
@@ -278,7 +280,7 @@ fn write_run_log(
     report.push_str(&format!("# build {}\n\n", started.to_rfc3339()));
     report.push_str(&format!(
         "actor: {}\nprovider: {}\nmodel: {}\n\n",
-        model.actor(),
+        backend.actor(),
         settings.provider,
         settings.name
     ));
@@ -346,63 +348,16 @@ mod tests {
 #[cfg(test)]
 mod integration {
     use super::*;
-    use crate::model::{Conversation, ToolCall, Turn};
-    use std::sync::Mutex;
+    use crate::model::tests::ScriptedBackend;
 
-    /// Replays a fixed script of turns, so the whole build path can run with
-    /// no network.
-    struct ScriptedModel {
-        turns: Mutex<Vec<Turn>>,
-    }
-
-    impl ScriptedModel {
-        fn new(turns: Vec<Turn>) -> Self {
-            Self {
-                turns: Mutex::new(turns),
-            }
-        }
-    }
-
-    impl Model for ScriptedModel {
-        fn actor(&self) -> String {
-            "lifewiki/test".into()
-        }
-        fn turn(
-            &self,
-            _system: &str,
-            _history: &mut Conversation,
-            _tools: &[rmcp::model::Tool],
-        ) -> Result<Turn> {
-            let mut turns = self.turns.lock().unwrap();
-            if turns.is_empty() {
-                bail!("script exhausted");
-            }
-            Ok(turns.remove(0))
-        }
-    }
-
-    fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
-        ToolCall {
-            id: format!("call_{name}"),
-            name: name.into(),
-            arguments,
-        }
-    }
-
-    fn write_and_finish(path: &str, content: &str) -> Vec<Turn> {
-        vec![
-            Turn {
-                calls: vec![call(
-                    "write_page",
-                    serde_json::json!({"path": path, "content": content}),
-                )],
-                ..Default::default()
-            },
-            Turn {
-                calls: vec![call("finish", serde_json::json!({"summary": "Recorded it."}))],
-                ..Default::default()
-            },
-        ]
+    fn write_and_finish(path: &str, content: &str) -> std::sync::Arc<ScriptedBackend> {
+        ScriptedBackend::new(vec![
+            ScriptedBackend::tool_call(
+                "write_page",
+                serde_json::json!({"path": path, "content": content}),
+            ),
+            ScriptedBackend::tool_call("finish", serde_json::json!({"summary": "Recorded it."})),
+        ])
     }
 
     /// A repo with a git identity, ready to build.
@@ -431,12 +386,11 @@ mod integration {
         let log = Log::open(home).unwrap();
         let first = log.append("oranges are my favourite fruit".into()).unwrap();
 
-        let model = ScriptedModel::new(write_and_finish(
+        let backend = write_and_finish(
             "/opinions/food.md",
             "---\ntype: Preference\n---\n\nPrefers oranges.\n",
-        ));
-        let report =
-            build_with(home, Options::default(), &model, &settings()).unwrap();
+        );
+        let report = build_with(home, Options::default(), backend, &settings()).unwrap();
 
         assert_eq!(report.events, 1);
         assert!(report.committed);
@@ -448,8 +402,8 @@ mod integration {
 
         // The commit covers wiki, cursor and log together, so the repo never
         // records a wiki claiming to reflect events it hasn't seen.
-        let files = crate::git::capture(home, &["show", "--name-only", "--format=", "HEAD"])
-            .unwrap();
+        let files =
+            crate::git::capture(home, &["show", "--name-only", "--format=", "HEAD"]).unwrap();
         assert!(files.contains("wiki/opinions/food.md"), "{files}");
         assert!(files.contains("state/cursor.json"), "{files}");
         assert!(files.contains("log/"), "{files}");
@@ -464,20 +418,20 @@ mod integration {
         let home = dir.path();
         Log::open(home).unwrap().append("something".into()).unwrap();
 
-        let model = ScriptedModel::new(write_and_finish(
-            "/a.md",
-            "---\ntype: Reference\n---\n\nSomething.\n",
-        ));
-        build_with(home, Options::default(), &model, &settings()).unwrap();
+        let backend = write_and_finish("/a.md", "---\ntype: Reference\n---\n\nSomething.\n");
+        build_with(home, Options::default(), backend, &settings()).unwrap();
         let head = crate::git::capture(home, &["rev-parse", "HEAD"]).unwrap();
 
         // An exhausted script would error if the agent ran at all.
-        let empty = ScriptedModel::new(vec![]);
-        let report = build_with(home, Options::default(), &empty, &settings()).unwrap();
+        let empty = ScriptedBackend::new(vec![]);
+        let report = build_with(home, Options::default(), empty, &settings()).unwrap();
 
         assert_eq!(report.events, 0);
         assert!(!report.committed);
-        assert_eq!(head, crate::git::capture(home, &["rev-parse", "HEAD"]).unwrap());
+        assert_eq!(
+            head,
+            crate::git::capture(home, &["rev-parse", "HEAD"]).unwrap()
+        );
     }
 
     #[test]
@@ -487,18 +441,12 @@ mod integration {
         let log = Log::open(home).unwrap();
         log.append("first".into()).unwrap();
 
-        let model = ScriptedModel::new(write_and_finish(
-            "/a.md",
-            "---\ntype: Reference\n---\n\nFirst.\n",
-        ));
-        build_with(home, Options::default(), &model, &settings()).unwrap();
+        let backend = write_and_finish("/a.md", "---\ntype: Reference\n---\n\nFirst.\n");
+        build_with(home, Options::default(), backend, &settings()).unwrap();
 
         let second = log.append("second".into()).unwrap();
-        let model = ScriptedModel::new(write_and_finish(
-            "/b.md",
-            "---\ntype: Reference\n---\n\nSecond.\n",
-        ));
-        let report = build_with(home, Options::default(), &model, &settings()).unwrap();
+        let backend = write_and_finish("/b.md", "---\ntype: Reference\n---\n\nSecond.\n");
+        let report = build_with(home, Options::default(), backend, &settings()).unwrap();
 
         assert_eq!(report.events, 1, "only the new event should be folded");
         assert_eq!(
@@ -514,19 +462,16 @@ mod integration {
         Log::open(home).unwrap().append("something".into()).unwrap();
 
         // Never calls finish, so the turn limit trips.
-        let model = ScriptedModel::new(
+        let backend = ScriptedBackend::new(
             (0..5)
-                .map(|_| Turn {
-                    calls: vec![call("list_pages", serde_json::json!({}))],
-                    ..Default::default()
-                })
+                .map(|_| ScriptedBackend::tool_call("list_pages", serde_json::json!({})))
                 .collect(),
         );
         let options = Options {
             max_turns: 2,
             ..Options::default()
         };
-        assert!(build_with(home, options, &model, &settings()).is_err());
+        assert!(build_with(home, options, backend, &settings()).is_err());
 
         assert!(
             Cursor::load(home).unwrap().last_event.is_none(),
@@ -549,8 +494,8 @@ mod integration {
         Log::open(home).unwrap().append("something".into()).unwrap();
         std::fs::write(home.join("wiki/scratch.md"), "uncommitted\n").unwrap();
 
-        let model = ScriptedModel::new(vec![]);
-        let error = build_with(home, Options::default(), &model, &settings())
+        let backend = ScriptedBackend::new(vec![]);
+        let error = build_with(home, Options::default(), backend, &settings())
             .unwrap_err()
             .to_string();
         assert!(error.contains("uncommitted"), "{error}");
@@ -563,19 +508,19 @@ mod integration {
         Log::open(home).unwrap().append("something".into()).unwrap();
         let head = crate::git::capture(home, &["rev-parse", "HEAD"]).unwrap();
 
-        let model = ScriptedModel::new(write_and_finish(
-            "/a.md",
-            "---\ntype: Reference\n---\n\nSomething.\n",
-        ));
+        let backend = write_and_finish("/a.md", "---\ntype: Reference\n---\n\nSomething.\n");
         let options = Options {
             dry_run: true,
             ..Options::default()
         };
-        let report = build_with(home, options, &model, &settings()).unwrap();
+        let report = build_with(home, options, backend, &settings()).unwrap();
 
         assert!(!report.committed);
         assert!(Cursor::load(home).unwrap().last_event.is_none());
-        assert_eq!(head, crate::git::capture(home, &["rev-parse", "HEAD"]).unwrap());
+        assert_eq!(
+            head,
+            crate::git::capture(home, &["rev-parse", "HEAD"]).unwrap()
+        );
     }
 
     #[test]
@@ -586,21 +531,21 @@ mod integration {
         Log::open(home).unwrap().append("something".into()).unwrap();
         let head = crate::git::capture(home, &["rev-parse", "HEAD"]).unwrap();
 
-        let model = ScriptedModel::new(write_and_finish(
-            "/a.md",
-            "---\ntype: Reference\n---\n\nSomething.\n",
-        ));
+        let backend = write_and_finish("/a.md", "---\ntype: Reference\n---\n\nSomething.\n");
         let options = Options {
             into: Some(scratch.path().to_path_buf()),
             ..Options::default()
         };
-        let report = build_with(home, options, &model, &settings()).unwrap();
+        let report = build_with(home, options, backend, &settings()).unwrap();
 
         assert!(scratch.path().join("a.md").exists());
         assert!(!home.join("wiki/a.md").exists());
         assert!(!report.committed);
         assert!(Cursor::load(home).unwrap().last_event.is_none());
-        assert_eq!(head, crate::git::capture(home, &["rev-parse", "HEAD"]).unwrap());
+        assert_eq!(
+            head,
+            crate::git::capture(home, &["rev-parse", "HEAD"]).unwrap()
+        );
     }
 
     #[test]
@@ -611,15 +556,12 @@ mod integration {
         let first = log.append("first".into()).unwrap();
         log.append("second".into()).unwrap();
 
-        let model = ScriptedModel::new(write_and_finish(
-            "/a.md",
-            "---\ntype: Reference\n---\n\nFirst only.\n",
-        ));
+        let backend = write_and_finish("/a.md", "---\ntype: Reference\n---\n\nFirst only.\n");
         let options = Options {
             to: Some(first.id.clone()),
             ..Options::default()
         };
-        let report = build_with(home, options, &model, &settings()).unwrap();
+        let report = build_with(home, options, backend, &settings()).unwrap();
         assert_eq!(report.events, 1);
     }
 
@@ -631,8 +573,8 @@ mod integration {
         let secret = log.append("my password is hunter2".into()).unwrap();
         log.redact(&secret.id, "password").unwrap();
 
-        let empty = ScriptedModel::new(vec![]);
-        let report = build_with(home, Options::default(), &empty, &settings()).unwrap();
+        let empty = ScriptedBackend::new(vec![]);
+        let report = build_with(home, Options::default(), empty, &settings()).unwrap();
         assert_eq!(report.events, 0, "a redacted event has no text to fold");
     }
 }

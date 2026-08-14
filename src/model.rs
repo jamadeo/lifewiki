@@ -1,16 +1,19 @@
-//! Model access for the reconciliation pipeline.
+//! Model access for the reconciliation agent.
 //!
-//! The pipeline talks to this module's `Model` trait, never to a provider
+//! The agent talks to this module's `Backend` trait, never to a provider
 //! directly. That keeps the pipeline testable without an API key (see
-//! `StubModel`) and keeps provider churn — these crates are 0.1.0-alpha —
-//! contained to this file.
+//! `tests::ScriptedBackend`) and keeps provider churn — these crates are
+//! `0.1.0-alpha` — contained to this file.
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use goose_providers::anthropic::{AnthropicProviderBuilder, ANTHROPIC_API_VERSION};
 use goose_providers::api_client::{ApiClient, AuthMethod};
 use goose_providers::base::Provider;
-use goose_providers::conversation::message::{Message, MessageContent};
+use goose_providers::conversation::message::Message;
 use goose_providers::model::ModelConfig;
+use rmcp::model::Tool;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// What a model call cost, for run logs.
@@ -20,84 +23,36 @@ pub struct Usage {
     pub output_tokens: Option<i32>,
 }
 
-/// A tool call the model wants to make.
-#[derive(Debug, Clone)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: serde_json::Value,
-}
-
-/// One turn of an agent loop: whatever the model said, plus any tool calls.
-#[derive(Debug, Default)]
-pub struct Turn {
-    pub text: String,
-    pub calls: Vec<ToolCall>,
-    pub usage: Usage,
-}
-
-pub trait Model: Send + Sync {
+/// One inference call. Async because `goose_agent`'s `Inference` trait is.
+#[async_trait]
+pub trait Backend: Send + Sync {
     /// Actor string for OKF `generated.by`, e.g. `lifewiki/claude-sonnet-4-5`.
     fn actor(&self) -> String;
 
-    /// One turn of a tool-using conversation. `history` is the running
-    /// transcript; the implementation appends the assistant reply to it so the
-    /// caller can add tool responses and call again.
-    fn turn(
+    async fn complete(
         &self,
         system: &str,
-        history: &mut Conversation,
-        tools: &[rmcp::model::Tool],
-    ) -> Result<Turn>;
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<(Message, Usage)>;
 }
 
-/// The running transcript of an agent loop. Wraps the provider message type so
-/// the pipeline never imports provider types directly.
-#[derive(Default)]
-pub struct Conversation {
-    messages: Vec<Message>,
-}
+/// A backend that refuses to run, so "no model configured" is a clear error
+/// rather than a network failure.
+pub struct StubBackend;
 
-impl Conversation {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn push_user(&mut self, text: impl Into<String>) {
-        self.messages.push(Message::user().with_text(text));
-    }
-
-    /// Record the result of a tool call, keyed to the request id.
-    pub fn push_tool_result(&mut self, call_id: &str, output: &str, is_error: bool) {
-        let result = if is_error {
-            rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(output)])
-        } else {
-            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(output)])
-        };
-        self.messages
-            .push(Message::user().with_tool_response(call_id, Ok(result)));
-    }
-
-    #[allow(dead_code)] // used by run logging once transcripts include turn counts
-    pub fn len(&self) -> usize {
-        self.messages.len()
-    }
-}
-
-/// A model that refuses to run. Used by the deterministic pipeline steps so
-/// that "no model configured" is only an error if something actually needs one.
-pub struct StubModel;
-
-impl Model for StubModel {
+#[async_trait]
+impl Backend for StubBackend {
     fn actor(&self) -> String {
-        "lifewiki/deterministic".to_string()
+        "lifewiki/none".to_string()
     }
-    fn turn(
+
+    async fn complete(
         &self,
         _system: &str,
-        _history: &mut Conversation,
-        _tools: &[rmcp::model::Tool],
-    ) -> Result<Turn> {
+        _messages: &[Message],
+        _tools: &[Tool],
+    ) -> Result<(Message, Usage)> {
         bail!(
             "no model is configured, so the wiki cannot be built.\n\
              Set [model] provider = \"anthropic\" in config.toml and export ANTHROPIC_API_KEY."
@@ -106,14 +61,13 @@ impl Model for StubModel {
 }
 
 /// Anthropic via `goose-providers`.
-pub struct AnthropicModel {
+pub struct AnthropicBackend {
     provider: goose_providers::anthropic::AnthropicProvider,
     config: ModelConfig,
     model_name: String,
-    runtime: tokio::runtime::Runtime,
 }
 
-impl AnthropicModel {
+impl AnthropicBackend {
     pub fn new(model_name: &str, timeout: Duration) -> Result<Self> {
         let key = std::env::var("ANTHROPIC_API_KEY")
             .ok()
@@ -133,68 +87,38 @@ impl AnthropicModel {
         )?
         .with_header("anthropic-version", ANTHROPIC_API_VERSION)?;
 
-        let provider = AnthropicProviderBuilder::new(api_client).build();
-        let config = ModelConfig::new(model_name).with_canonical_limits("anthropic");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("could not start async runtime")?;
-
         Ok(Self {
-            provider,
-            config,
+            provider: AnthropicProviderBuilder::new(api_client).build(),
+            config: ModelConfig::new(model_name).with_canonical_limits("anthropic"),
             model_name: model_name.to_string(),
-            runtime,
         })
     }
 }
 
-impl Model for AnthropicModel {
+#[async_trait]
+impl Backend for AnthropicBackend {
     fn actor(&self) -> String {
         format!("lifewiki/{}", self.model_name.replace('.', "-"))
     }
 
-    fn turn(
+    async fn complete(
         &self,
         system: &str,
-        history: &mut Conversation,
-        tools: &[rmcp::model::Tool],
-    ) -> Result<Turn> {
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<(Message, Usage)> {
         let (reply, usage) = self
-            .runtime
-            .block_on(async {
-                self.provider
-                    .complete(&self.config, system, &history.messages, tools)
-                    .await
-            })
+            .provider
+            .complete(&self.config, system, messages, tools)
+            .await
             .context("model request failed")?;
-
-        let mut turn = Turn {
-            text: reply.as_concat_text(),
-            usage: Usage {
+        Ok((
+            reply,
+            Usage {
                 input_tokens: usage.usage.input_tokens,
                 output_tokens: usage.usage.output_tokens,
             },
-            ..Turn::default()
-        };
-        for content in &reply.content {
-            if let MessageContent::ToolRequest(request) = content {
-                match &request.tool_call {
-                    Ok(call) => turn.calls.push(ToolCall {
-                        id: request.id.clone(),
-                        name: call.name.to_string(),
-                        arguments: call
-                            .arguments
-                            .clone()
-                            .map(serde_json::Value::Object)
-                            .unwrap_or(serde_json::Value::Null),
-                    }),
-                    Err(error) => bail!("model produced an invalid tool call: {error}"),
-                }
-            }
-        }
-        history.messages.push(reply);
-        Ok(turn)
+        ))
     }
 }
 
@@ -249,26 +173,81 @@ impl ModelSettings {
     }
 }
 
-/// Build the configured model. Errors here should be surfaced only when a
-/// model is actually required, so callers that can work deterministically
-/// should not call this at all.
-pub fn build(settings: &ModelSettings) -> Result<Box<dyn Model>> {
+pub fn build(settings: &ModelSettings) -> Result<Arc<dyn Backend>> {
     let timeout = Duration::from_secs(settings.timeout_seconds);
     match settings.provider.as_str() {
-        "anthropic" => Ok(Box::new(AnthropicModel::new(&settings.name, timeout)?)),
-        "none" | "stub" => Ok(Box::new(StubModel)),
+        "anthropic" => Ok(Arc::new(AnthropicBackend::new(&settings.name, timeout)?)),
+        "none" | "stub" => Ok(Arc::new(StubBackend)),
         other => bail!("unknown model provider `{other}`; expected `anthropic` or `none`"),
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
+    use rmcp::model::CallToolRequestParams;
+    use std::sync::Mutex;
 
-    #[test]
-    fn stub_refuses_and_says_why() {
-        let error = StubModel
-            .turn("s", &mut Conversation::new(), &[])
+    /// Replays a fixed script of assistant messages, and records what it was
+    /// asked, so tests can assert the loop feeds tool results back.
+    pub struct ScriptedBackend {
+        replies: Mutex<Vec<Message>>,
+        seen: Mutex<Vec<Message>>,
+    }
+
+    impl ScriptedBackend {
+        pub fn new(replies: Vec<Message>) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(replies),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// An assistant message calling one tool.
+        pub fn tool_call(name: &str, arguments: serde_json::Value) -> Message {
+            let mut params = CallToolRequestParams::new(name.to_string());
+            if let serde_json::Value::Object(map) = arguments {
+                params = params.with_arguments(map);
+            }
+            Message::assistant().with_tool_request(format!("call_{name}"), Ok(params))
+        }
+
+        pub fn text(text: &str) -> Message {
+            Message::assistant().with_text(text)
+        }
+
+        /// The messages passed to the most recent `complete` call.
+        pub fn last_messages(&self) -> Vec<Message> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Backend for ScriptedBackend {
+        fn actor(&self) -> String {
+            "lifewiki/test".into()
+        }
+
+        async fn complete(
+            &self,
+            _system: &str,
+            messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<(Message, Usage)> {
+            *self.seen.lock().unwrap() = messages.to_vec();
+            let mut replies = self.replies.lock().unwrap();
+            if replies.is_empty() {
+                bail!("script exhausted");
+            }
+            Ok((replies.remove(0), Usage::default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stub_refuses_and_says_why() {
+        let error = StubBackend
+            .complete("s", &[], &[])
+            .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("no model is configured"), "{error}");
@@ -277,22 +256,29 @@ mod tests {
 
     #[test]
     fn actor_is_okf_shaped() {
-        assert_eq!(StubModel.actor(), "lifewiki/deterministic");
+        assert_eq!(StubBackend.actor(), "lifewiki/none");
     }
 
     /// Real network call. Ignored by default; run with:
     ///   cargo test -- --ignored --nocapture
-    #[test]
+    #[tokio::test]
     #[ignore]
-    fn anthropic_round_trip() {
-        let model = AnthropicModel::new("claude-sonnet-4-5", Duration::from_secs(60)).unwrap();
-        let mut history = Conversation::new();
-        history.push_user("Say the word: apples");
-        let turn = model
-            .turn("Reply with exactly one word.", &mut history, &[])
+    async fn anthropic_round_trip() {
+        let backend = AnthropicBackend::new("claude-sonnet-4-5", Duration::from_secs(60)).unwrap();
+        let (reply, usage) = backend
+            .complete(
+                "Reply with exactly one word.",
+                &[Message::user().with_text("Say the word: apples")],
+                &[],
+            )
+            .await
             .unwrap();
-        println!("actor={} text={:?}", model.actor(), turn.text);
-        println!("usage={:?}", turn.usage);
-        assert!(turn.text.to_lowercase().contains("apples"));
+        println!(
+            "actor={} text={:?}",
+            backend.actor(),
+            reply.as_concat_text()
+        );
+        println!("usage={usage:?}");
+        assert!(reply.as_concat_text().to_lowercase().contains("apples"));
     }
 }

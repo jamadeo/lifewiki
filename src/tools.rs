@@ -23,6 +23,7 @@ pub struct Journal {
     pub searches: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
     pub journal: Journal,

@@ -1,18 +1,33 @@
-//! The reconciliation agent.
+//! The reconciliation agent, driven by `goose_agent`'s `StateMachine`.
 //!
-//! Given a batch of new log events, the agent explores the wiki with tools and
-//! rewrites whatever the events contradict or extend. There is no fixed
-//! retrieve-then-rewrite pipeline: search, read and write are tools, and the
-//! agent decides how to use them.
+//! The machine tries each step in order on every iteration; the first that
+//! applies produces effects and the loop repeats. Our steps are:
 //!
-//! The loop is deliberately bounded. An agent with write access to your wiki
-//! that can loop indefinitely is a way to burn money and corrupt pages, so
-//! every run has a hard turn limit and every write is validated first.
+//!   1. `MaxTurnsOperation`  — stop before an agent with write access runs away
+//!   2. `ToolExecutionOperation` — run the wiki tools the model asked for
+//!   3. `FinishOperation`    — the model called `finish`; yield
+//!   4. `InferenceRunner`    — otherwise, ask the model what to do next
+//!
+//! Operations are ours because goose's are not public API. Keeping them small
+//! and in one file is deliberate: the interesting behaviour is in the tools and
+//! the prompt, not the loop.
 
 use crate::event::Event;
-use crate::model::{Conversation, Model, Usage};
+use crate::model::{Backend, Usage};
 use crate::tools::{self, Workspace};
 use anyhow::{bail, Result};
+use async_trait::async_trait;
+use goose_agent::machine::{EffectHandler, MachineSession, SessionLoader, StateMachine, Step};
+use goose_agent::operation::{
+    applied, ends_turn, not_applicable, ConversationEffect, Emitter, Inference, InferenceInput,
+    Operation, OperationResult, StepResult,
+};
+use goose_providers::conversation::message::{Message, MessageContent, ToolRequest};
+use goose_providers::conversation::Conversation;
+use rmcp::model::{CallToolResult, ContentBlock, Tool};
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_MAX_TURNS: usize = 24;
 
@@ -22,98 +37,446 @@ pub struct Outcome {
     pub turns: usize,
     pub usage: Usage,
     pub journal: tools::Journal,
-    /// Full transcript for the run log.
     pub transcript: Vec<String>,
 }
 
-pub struct Reconciler<'a> {
-    pub model: &'a dyn Model,
+/// Everything a step may touch. The `StateMachine` hands `&Session` to each
+/// operation, so shared mutable state lives behind mutexes here.
+pub struct Session {
+    id: String,
+    conversation: Conversation,
+    workspace: Arc<Mutex<Workspace>>,
+    record: Arc<Mutex<Record>>,
+}
+
+#[derive(Default)]
+struct Record {
+    transcript: Vec<String>,
+    usage: Usage,
+    turns: usize,
+    summary: Option<String>,
+}
+
+impl MachineSession for Session {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn conversation(&self) -> Option<&Conversation> {
+        Some(&self.conversation)
+    }
+}
+
+/// Owns the conversation between machine iterations. `StateMachine::run` calls
+/// `load` at the top of each pass and `apply_effects` at the end, so this is
+/// where the transcript actually lives.
+struct Runtime {
+    conversation: Mutex<Conversation>,
+    workspace: Arc<Mutex<Workspace>>,
+    record: Arc<Mutex<Record>>,
+}
+
+#[async_trait]
+impl SessionLoader<Session> for Runtime {
+    async fn load(&self, session_id: &str) -> Result<Session> {
+        Ok(Session {
+            id: session_id.to_string(),
+            conversation: self.conversation.lock().unwrap().clone(),
+            workspace: self.workspace.clone(),
+            record: self.record.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl EffectHandler<Session, ConversationEffect> for Runtime {
+    async fn apply_effects(
+        &self,
+        _session: &Session,
+        effects: &mut [ConversationEffect],
+        _emit: &Emitter,
+    ) -> Result<()> {
+        let mut conversation = self.conversation.lock().unwrap();
+        for effect in effects {
+            match effect {
+                ConversationEffect::AppendMessage(message) => conversation.push(message.clone()),
+                ConversationEffect::ReplaceConversation(replacement) => {
+                    *conversation = replacement.clone()
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Stop the loop before an agent with write access to the wiki runs away.
+struct MaxTurnsOperation {
+    limit: usize,
+}
+
+#[async_trait]
+impl Operation<Session, ConversationEffect> for MaxTurnsOperation {
+    fn name(&self) -> &'static str {
+        "max_turns"
+    }
+
+    async fn run(
+        &self,
+        session: &Session,
+        _conversation: &Conversation,
+        _emit: &Emitter,
+    ) -> Result<OperationResult<ConversationEffect>> {
+        let turns = session.record.lock().unwrap().turns;
+        if turns >= self.limit {
+            bail!(
+                "reconciliation did not finish within {} turns; the wiki may be \
+                 partially updated (run `git checkout -- wiki/` to discard)",
+                self.limit
+            );
+        }
+        not_applicable()
+    }
+}
+
+/// Execute pending tool calls against the wiki.
+struct ToolExecutionOperation;
+
+impl ToolExecutionOperation {
+    /// Tool requests in the last assistant message that have no response yet.
+    fn pending(conversation: &Conversation) -> Vec<ToolRequest> {
+        let messages = conversation.messages();
+        let Some(last) = messages.last() else {
+            return Vec::new();
+        };
+        if last.role != rmcp::model::Role::Assistant {
+            return Vec::new();
+        }
+        last.content
+            .iter()
+            .filter_map(|content| match content {
+                MessageContent::ToolRequest(request) => Some(request.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Operation<Session, ConversationEffect> for ToolExecutionOperation {
+    fn name(&self) -> &'static str {
+        "tool_execution"
+    }
+
+    async fn inference_tools(&self, _session: &Session) -> Result<Vec<Tool>> {
+        Ok(tools::definitions())
+    }
+
+    async fn run(
+        &self,
+        session: &Session,
+        conversation: &Conversation,
+        _emit: &Emitter,
+    ) -> Result<OperationResult<ConversationEffect>> {
+        let pending = Self::pending(conversation);
+        // `finish` is handled by its own operation, which must run first.
+        if pending.is_empty() || pending.iter().any(|request| is_finish(request)) {
+            return not_applicable();
+        }
+
+        let mut response = Message::user();
+        let turn = session.record.lock().unwrap().turns;
+
+        for request in pending {
+            let (name, arguments) = match &request.tool_call {
+                Ok(call) => (
+                    call.name.to_string(),
+                    call.arguments
+                        .clone()
+                        .map(serde_json::Value::Object)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                Err(error) => {
+                    let text = format!("Error: invalid tool call: {error}");
+                    response = response.with_tool_response(
+                        request.id.clone(),
+                        Ok(CallToolResult::error(vec![ContentBlock::text(text)])),
+                    );
+                    continue;
+                }
+            };
+
+            let (output, is_error) = {
+                let mut workspace = session.workspace.lock().unwrap();
+                tools::dispatch(&mut workspace, &name, &arguments)
+            };
+
+            session.record.lock().unwrap().transcript.push(format!(
+                "[{turn}] {name}({}) -> {}{}",
+                compact(&arguments),
+                if is_error { "ERROR " } else { "" },
+                first_line(&output)
+            ));
+
+            let result = if is_error {
+                CallToolResult::error(vec![ContentBlock::text(output)])
+            } else {
+                CallToolResult::success(vec![ContentBlock::text(output)])
+            };
+            response = response.with_tool_response(request.id.clone(), Ok(result));
+        }
+
+        applied([ConversationEffect::AppendMessage(response)])
+    }
+}
+
+/// The model called `finish`: record the summary and stop the machine.
+struct FinishOperation;
+
+#[async_trait]
+impl Operation<Session, ConversationEffect> for FinishOperation {
+    fn name(&self) -> &'static str {
+        "finish"
+    }
+
+    async fn run(
+        &self,
+        session: &Session,
+        conversation: &Conversation,
+        _emit: &Emitter,
+    ) -> Result<OperationResult<ConversationEffect>> {
+        let pending = ToolExecutionOperation::pending(conversation);
+        let Some(request) = pending.iter().find(|request| is_finish(request)) else {
+            return not_applicable();
+        };
+
+        let summary = request
+            .tool_call
+            .as_ref()
+            .ok()
+            .and_then(|call| call.arguments.clone())
+            .and_then(|arguments| {
+                arguments
+                    .get("summary")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "(no summary given)".to_string());
+
+        {
+            let mut record = session.record.lock().unwrap();
+            let turns = record.turns;
+            record
+                .transcript
+                .push(format!("[{turns}] finish: {summary}"));
+            record.summary = Some(summary);
+        }
+
+        // Answer the tool call so the conversation stays well-formed, then stop.
+        let response = Message::user().with_tool_response(
+            request.id.clone(),
+            Ok(CallToolResult::success(vec![ContentBlock::text("Done.")])),
+        );
+        Ok(OperationResult::Applied(StepResult {
+            effects: vec![ConversationEffect::AppendMessage(response)],
+            applied_step: None,
+            yield_to_client: true,
+        }))
+    }
+}
+
+/// The model replied with prose and no tool calls, so it has nothing further to
+/// do. `StateMachine::step` always reaches the inference step, so without this
+/// the loop would ask again forever.
+struct EndTurnOperation;
+
+#[async_trait]
+impl Operation<Session, ConversationEffect> for EndTurnOperation {
+    fn name(&self) -> &'static str {
+        "end_turn"
+    }
+
+    async fn run(
+        &self,
+        session: &Session,
+        conversation: &Conversation,
+        _emit: &Emitter,
+    ) -> Result<OperationResult<ConversationEffect>> {
+        if !ends_turn(conversation.messages()) {
+            return not_applicable();
+        }
+        let mut record = session.record.lock().unwrap();
+        if record.summary.is_none() {
+            let text = conversation
+                .messages()
+                .last()
+                .map(|message| message.as_concat_text())
+                .unwrap_or_default();
+            record.summary = Some(text.trim().to_string());
+        }
+        Ok(OperationResult::Applied(StepResult {
+            effects: Vec::new(),
+            applied_step: None,
+            yield_to_client: true,
+        }))
+    }
+}
+
+/// Ask the model what to do next.
+struct InferenceRunner {
+    backend: Arc<dyn Backend>,
+    system: String,
+}
+
+#[async_trait]
+impl Operation<Session, ConversationEffect> for InferenceRunner {
+    fn name(&self) -> &'static str {
+        "inference"
+    }
+}
+
+#[async_trait]
+impl Inference<Session, ConversationEffect> for InferenceRunner {
+    fn applies(&self, conversation: &Conversation) -> bool {
+        // Only infer when the model isn't already mid-turn: if the last message
+        // ends the turn with no tool calls, we're done rather than looping.
+        !ends_turn(conversation.messages())
+    }
+
+    async fn infer(
+        &self,
+        session: &Session,
+        conversation: &Conversation,
+        input: InferenceInput,
+        _emit: &Emitter,
+    ) -> Result<OperationResult<ConversationEffect>> {
+        let (reply, usage) = self
+            .backend
+            .complete(&self.system, conversation.messages(), &input.tools)
+            .await?;
+
+        {
+            let mut record = session.record.lock().unwrap();
+            record.turns += 1;
+            if let Some(input_tokens) = usage.input_tokens {
+                *record.usage.input_tokens.get_or_insert(0) += input_tokens;
+            }
+            if let Some(output_tokens) = usage.output_tokens {
+                *record.usage.output_tokens.get_or_insert(0) += output_tokens;
+            }
+            let text = reply.as_concat_text();
+            if !text.trim().is_empty() {
+                let turns = record.turns;
+                record.transcript.push(format!("[{turns}] {}", text.trim()));
+            }
+        }
+
+        applied([ConversationEffect::AppendMessage(reply)])
+    }
+}
+
+fn is_finish(request: &ToolRequest) -> bool {
+    request
+        .tool_call
+        .as_ref()
+        .map(|call| call.name == "finish")
+        .unwrap_or(false)
+}
+
+pub struct Reconciler {
+    backend: Arc<dyn Backend>,
     pub max_turns: usize,
 }
 
-impl<'a> Reconciler<'a> {
-    pub fn new(model: &'a dyn Model) -> Self {
+impl Reconciler {
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self {
-            model,
+            backend,
             max_turns: DEFAULT_MAX_TURNS,
         }
     }
 
-    pub fn run(&self, workspace: &mut Workspace, events: &[Event]) -> Result<Outcome> {
+    pub fn run(&self, workspace: Workspace, events: &[Event]) -> Result<(Outcome, Workspace)> {
         if events.is_empty() {
             bail!("no events to reconcile");
         }
-        let definitions = tools::definitions();
-        let mut conversation = Conversation::new();
-        conversation.push_user(kickoff(events, &self.model.actor(), &now()));
 
-        let mut transcript = Vec::new();
-        let mut usage = Usage::default();
+        let kickoff = Message::user().with_text(kickoff(events, &self.backend.actor(), &now()));
+        let workspace = Arc::new(Mutex::new(workspace));
+        let record = Arc::new(Mutex::new(Record::default()));
 
-        for turn_number in 1..=self.max_turns {
-            let turn = self.model.turn(SYSTEM, &mut conversation, &definitions)?;
-            accumulate(&mut usage, turn.usage);
+        let runtime = Runtime {
+            conversation: Mutex::new(Conversation::new_unvalidated([kickoff])),
+            workspace: workspace.clone(),
+            record: record.clone(),
+        };
 
-            if !turn.text.trim().is_empty() {
-                transcript.push(format!("[{turn_number}] {}", turn.text.trim()));
+        let inference = Arc::new(InferenceRunner {
+            backend: self.backend.clone(),
+            system: SYSTEM.to_string(),
+        });
+
+        let steps: Vec<Step<'_, Session, ConversationEffect>> = vec![
+            Step::Operation(Arc::new(MaxTurnsOperation {
+                limit: self.max_turns,
+            })),
+            Step::Operation(Arc::new(FinishOperation)),
+            Step::Operation(Arc::new(EndTurnOperation)),
+            Step::Operation(Arc::new(ToolExecutionOperation)),
+            Step::Inference(inference),
+        ];
+
+        let cancel = CancellationToken::new();
+        let machine = StateMachine::new(steps, cancel.clone());
+
+        // The machine is async; the CLI is not. A current-thread runtime keeps
+        // `lw build` a plain blocking command.
+        let (tx, mut rx) = mpsc::channel(64);
+        let emitter = Emitter::new(tx, cancel);
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let outcome = machine.run(&runtime, "reconcile", &emitter).await;
+                rx.close();
+                while rx.recv().await.is_some() {}
+                outcome
+            });
+        result?;
+
+        // `runtime` still holds clones of these Arcs, so copy the data out
+        // rather than trying to take ownership.
+        let record = {
+            let guard = record.lock().unwrap();
+            Record {
+                transcript: guard.transcript.clone(),
+                usage: guard.usage,
+                turns: guard.turns,
+                summary: guard.summary.clone(),
             }
+        };
+        let workspace = {
+            let guard = workspace.lock().unwrap();
+            guard.clone()
+        };
 
-            if turn.calls.is_empty() {
-                // No tool calls and no explicit finish: treat the text as the
-                // summary and stop, rather than prompting in a loop.
-                return Ok(Outcome {
-                    summary: turn.text.trim().to_string(),
-                    turns: turn_number,
-                    usage,
-                    journal: workspace.journal.clone(),
-                    transcript,
-                });
-            }
+        let summary = record.summary.clone().unwrap_or_else(|| {
+            // The model stopped without calling finish; its last words are the
+            // best summary available.
+            record
+                .transcript
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "(no summary)".to_string())
+        });
 
-            for call in &turn.calls {
-                if call.name == "finish" {
-                    let summary = call
-                        .arguments
-                        .get("summary")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("(no summary given)")
-                        .to_string();
-                    transcript.push(format!("[{turn_number}] finish: {summary}"));
-                    return Ok(Outcome {
-                        summary,
-                        turns: turn_number,
-                        usage,
-                        journal: workspace.journal.clone(),
-                        transcript,
-                    });
-                }
-
-                let (output, is_error) = tools::dispatch(workspace, &call.name, &call.arguments);
-                transcript.push(format!(
-                    "[{turn_number}] {}({}) -> {}{}",
-                    call.name,
-                    compact(&call.arguments),
-                    if is_error { "ERROR " } else { "" },
-                    first_line(&output)
-                ));
-                conversation.push_tool_result(&call.id, &output, is_error);
-            }
-        }
-
-        bail!(
-            "reconciliation did not finish within {} turns; \
-             the wiki may be partially updated (run `git checkout -- wiki/` to discard)",
-            self.max_turns
-        )
-    }
-}
-
-fn accumulate(total: &mut Usage, turn: Usage) {
-    if let Some(input) = turn.input_tokens {
-        *total.input_tokens.get_or_insert(0) += input;
-    }
-    if let Some(output) = turn.output_tokens {
-        *total.output_tokens.get_or_insert(0) += output;
+        let outcome = Outcome {
+            summary,
+            turns: record.turns,
+            usage: record.usage,
+            journal: workspace.journal.clone(),
+            transcript: record.transcript,
+        };
+        Ok((outcome, workspace))
     }
 }
 
@@ -133,6 +496,10 @@ fn compact(arguments: &serde_json::Value) -> String {
     } else {
         rendered
     }
+}
+
+fn now() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 pub const SYSTEM: &str = r#"You maintain a personal wiki that is derived from an append-only log of things
@@ -206,10 +573,6 @@ Guessing wrong silently is worse than admitting you could not tell.
 When the wiki fully reflects the events, call `finish` with a short summary of
 what you changed and why."#;
 
-fn now() -> String {
-    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
 fn kickoff(events: &[Event], actor: &str, timestamp: &str) -> String {
     let mut text = format!(
         "Fold these new log events into the wiki. Search before you write.\n\n\
@@ -232,49 +595,7 @@ fn kickoff(events: &[Event], actor: &str, timestamp: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ToolCall, Turn};
-    use std::cell::RefCell;
-    use std::sync::Mutex;
-
-    /// A model that replays a fixed script of turns.
-    struct ScriptedModel {
-        turns: Mutex<RefCell<Vec<Turn>>>,
-    }
-
-    impl ScriptedModel {
-        fn new(turns: Vec<Turn>) -> Self {
-            Self {
-                turns: Mutex::new(RefCell::new(turns)),
-            }
-        }
-    }
-
-    impl Model for ScriptedModel {
-        fn actor(&self) -> String {
-            "lifewiki/test".into()
-        }
-        fn turn(
-            &self,
-            _system: &str,
-            _history: &mut Conversation,
-            _tools: &[rmcp::model::Tool],
-        ) -> Result<Turn> {
-            let guard = self.turns.lock().unwrap();
-            let mut turns = guard.borrow_mut();
-            if turns.is_empty() {
-                bail!("script exhausted");
-            }
-            Ok(turns.remove(0))
-        }
-    }
-
-    fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
-        ToolCall {
-            id: format!("call_{name}"),
-            name: name.to_string(),
-            arguments,
-        }
-    }
+    use crate::model::tests::ScriptedBackend;
 
     fn event(text: &str) -> Event {
         Event {
@@ -292,60 +613,46 @@ mod tests {
     #[test]
     fn writes_a_page_and_finishes() {
         let dir = scratch();
-        let mut workspace = Workspace::new(dir.path()).unwrap();
-        let model = ScriptedModel::new(vec![
-            Turn {
-                calls: vec![call("search_wiki", serde_json::json!({"query": "apples"}))],
-                ..Default::default()
-            },
-            Turn {
-                calls: vec![call(
-                    "write_page",
-                    serde_json::json!({
-                        "path": "/opinions/food.md",
-                        "content": "---\ntype: Preference\n---\n\nPrefers apples.\n"
-                    }),
-                )],
-                ..Default::default()
-            },
-            Turn {
-                calls: vec![call(
-                    "finish",
-                    serde_json::json!({"summary": "Recorded fruit preference."}),
-                )],
-                ..Default::default()
-            },
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let backend = ScriptedBackend::new(vec![
+            ScriptedBackend::tool_call("search_wiki", serde_json::json!({"query": "apples"})),
+            ScriptedBackend::tool_call(
+                "write_page",
+                serde_json::json!({
+                    "path": "/opinions/food.md",
+                    "content": "---\ntype: Preference\n---\n\nPrefers apples.\n"
+                }),
+            ),
+            ScriptedBackend::tool_call(
+                "finish",
+                serde_json::json!({"summary": "Recorded fruit preference."}),
+            ),
         ]);
 
-        let outcome = Reconciler::new(&model)
-            .run(&mut workspace, &[event("I prefer apples")])
+        let (outcome, _) = Reconciler::new(backend)
+            .run(workspace, &[event("I prefer apples")])
             .unwrap();
 
         assert_eq!(outcome.summary, "Recorded fruit preference.");
         assert_eq!(outcome.journal.writes, vec!["/opinions/food.md"]);
         assert!(dir.path().join("opinions/food.md").exists());
+        assert_eq!(outcome.turns, 3);
     }
 
     #[test]
     fn invalid_page_is_reported_to_the_model_not_written() {
         let dir = scratch();
-        let mut workspace = Workspace::new(dir.path()).unwrap();
-        let model = ScriptedModel::new(vec![
-            Turn {
-                calls: vec![call(
-                    "write_page",
-                    serde_json::json!({"path": "/a.md", "content": "no frontmatter"}),
-                )],
-                ..Default::default()
-            },
-            Turn {
-                calls: vec![call("finish", serde_json::json!({"summary": "gave up"}))],
-                ..Default::default()
-            },
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let backend = ScriptedBackend::new(vec![
+            ScriptedBackend::tool_call(
+                "write_page",
+                serde_json::json!({"path": "/a.md", "content": "no frontmatter"}),
+            ),
+            ScriptedBackend::tool_call("finish", serde_json::json!({"summary": "gave up"})),
         ]);
 
-        let outcome = Reconciler::new(&model)
-            .run(&mut workspace, &[event("something")])
+        let (outcome, _) = Reconciler::new(backend)
+            .run(workspace, &[event("something")])
             .unwrap();
 
         assert!(
@@ -363,19 +670,17 @@ mod tests {
     #[test]
     fn turn_limit_is_enforced() {
         let dir = scratch();
-        let mut workspace = Workspace::new(dir.path()).unwrap();
-        let turns = (0..10)
-            .map(|_| Turn {
-                calls: vec![call("list_pages", serde_json::json!({}))],
-                ..Default::default()
-            })
-            .collect();
-        let model = ScriptedModel::new(turns);
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let backend = ScriptedBackend::new(
+            (0..10)
+                .map(|_| ScriptedBackend::tool_call("list_pages", serde_json::json!({})))
+                .collect(),
+        );
 
-        let mut reconciler = Reconciler::new(&model);
+        let mut reconciler = Reconciler::new(backend);
         reconciler.max_turns = 3;
         let error = reconciler
-            .run(&mut workspace, &[event("x")])
+            .run(workspace, &[event("x")])
             .unwrap_err()
             .to_string();
         assert!(error.contains("within 3 turns"), "{error}");
@@ -384,15 +689,49 @@ mod tests {
     #[test]
     fn plain_text_reply_ends_the_run() {
         let dir = scratch();
-        let mut workspace = Workspace::new(dir.path()).unwrap();
-        let model = ScriptedModel::new(vec![Turn {
-            text: "Nothing to change.".into(),
-            ..Default::default()
-        }]);
-        let outcome = Reconciler::new(&model)
-            .run(&mut workspace, &[event("x")])
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let backend = ScriptedBackend::new(vec![ScriptedBackend::text("Nothing to change.")]);
+        let (outcome, _) = Reconciler::new(backend)
+            .run(workspace, &[event("x")])
             .unwrap();
-        assert_eq!(outcome.summary, "Nothing to change.");
         assert_eq!(outcome.turns, 1);
+        assert!(
+            outcome.summary.contains("Nothing to change."),
+            "{:?}",
+            outcome.summary
+        );
+    }
+
+    #[test]
+    fn tool_results_reach_the_model() {
+        let dir = scratch();
+        std::fs::write(
+            dir.path().join("food.md"),
+            "---\ntype: Preference\n---\n\nPrefers oranges.\n",
+        )
+        .unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let backend = ScriptedBackend::new(vec![
+            ScriptedBackend::tool_call("search_wiki", serde_json::json!({"query": "oranges"})),
+            ScriptedBackend::tool_call("finish", serde_json::json!({"summary": "done"})),
+        ]);
+        let backend_handle = backend.clone();
+
+        let (outcome, _) = Reconciler::new(backend)
+            .run(workspace, &[event("I prefer apples now")])
+            .unwrap();
+
+        assert_eq!(outcome.turns, 2);
+        // The second inference must have seen the search result.
+        let seen = backend_handle.last_messages();
+        let rendered = seen
+            .iter()
+            .map(|message| format!("{:?}", message.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("food.md"),
+            "the tool response was not fed back: {rendered}"
+        );
     }
 }

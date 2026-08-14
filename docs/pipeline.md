@@ -120,11 +120,26 @@ No tools and no multi-turn state, because reconciliation is a pure function of
    through the same crate, so "run this entirely locally" — which matters when the
    input is your whole life — is a config change, not a rewrite.
 
-`goose-agent`'s state machine is not used: it is built around persisted chat
-sessions (`SessionLoader`, `Conversation`, `EffectHandler`), while our loop is
-synchronous, single-session and short-lived. We drive `Provider` directly and
-keep the loop in `src/reconcile.rs`, which is ~100 lines. Its tool types come
-from `rmcp`, the same version goose uses.
+The loop itself is `goose_agent::machine::StateMachine` (S32). Its operations are
+not yet public API, so we implement our own in `src/reconcile.rs`:
+
+| step | role |
+|------|------|
+| `MaxTurnsOperation` | stop before an agent with write access runs away |
+| `FinishOperation` | the model called `finish`; record the summary and yield |
+| `EndTurnOperation` | the model replied with prose and no tool calls; stop |
+| `ToolExecutionOperation` | run the requested wiki tools, feed results back |
+| `InferenceRunner` | otherwise, ask the model what to do next |
+
+The machine tries each step in order per iteration; the first that applies
+produces effects and the loop repeats. `SessionLoader` reloads the conversation
+at the top of each pass and `EffectHandler` applies the effects at the end, so
+the transcript lives in one place rather than being threaded through the loop.
+
+One sharp edge worth recording: `StateMachine::step` always reaches the
+inference step — it does not consult `Inference::applies` — so a plain-prose
+reply with no tool calls will loop forever unless an operation before inference
+terminates the turn. Hence `EndTurnOperation`.
 
 Configuration lives in `config.toml`:
 

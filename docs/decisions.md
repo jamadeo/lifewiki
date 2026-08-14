@@ -36,6 +36,7 @@ All phase-1 decisions are settled. Newer decisions are appended as they're made.
 | S29 | The cursor advances only after a successful agent run | a failed or interrupted build leaves a dirty tree that `git checkout -- wiki/` discards, and the next build retries the same events. Crash-safety without a journal |
 | S30 | `lw build` refuses to run on a dirty `wiki/` | otherwise a build would mix hand-edits into its own commit, or destroy them. Forces the D11 question to be answered deliberately rather than by accident |
 | S31 | Run logs are written even when the agent fails | a failed run is exactly when the transcript is most useful |
+| S32 | The agent loop is `goose_agent::machine::StateMachine`, with operations we implement ourselves | goose's own operations are not public API yet, but the machine is. Using it means the loop's shape (ordered steps, effects, cancellation, session reload per pass) is shared with goose rather than reinvented, and our operations become contributable upstream as they stabilise | a hand-rolled loop (previous implementation); waiting for goose to publish its operations |
 
 ## Open (phase 2, raised by S21)
 
