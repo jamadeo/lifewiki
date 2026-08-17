@@ -46,6 +46,25 @@ pub struct Role {
     pub terminal_argument: &'static str,
     /// Give up after this many turns.
     pub max_turns: usize,
+    /// Start warning the model when this many turns remain.
+    pub warn_at: usize,
+    /// How to phrase the warning. `{remaining}` is substituted.
+    pub warning: &'static str,
+    /// What running out means for this role.
+    pub exhausted: Exhausted,
+}
+
+/// What to do when a run uses its whole budget without calling its terminal
+/// tool.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Exhausted {
+    /// Fail. A half-finished build has written pages without knowing whether
+    /// they are consistent, so the cursor must not advance.
+    Fail,
+    /// Report the given text as the result. For a question, running out of
+    /// searches without finding anything *is* the answer, and telling the user
+    /// that is more useful than an error.
+    Report(&'static str),
 }
 
 pub const BUILD: Role = Role {
@@ -53,7 +72,17 @@ pub const BUILD: Role = Role {
     system: crate::prompts::BUILD,
     terminal_tool: "finish",
     terminal_argument: "summary",
-    max_turns: 24,
+    // A build typically takes 5-6 turns. The ceiling is generous because a
+    // large batch of events legitimately needs more, but the warning starts
+    // well before it.
+    max_turns: 16,
+    warn_at: 8,
+    exhausted: Exhausted::Fail,
+    warning: "You have {remaining} turns left before this run is stopped. Finish \
+              the most important edits now and call `finish`. A partial, \
+              accurate wiki is better than an interrupted one — anything you \
+              leave undone can be folded by a later build, but only if you \
+              say what you did not get to.",
 };
 
 pub const ASK: Role = Role {
@@ -61,7 +90,22 @@ pub const ASK: Role = Role {
     system: crate::prompts::ASK,
     terminal_tool: "answer",
     terminal_argument: "text",
-    max_turns: 16,
+    // An answerable question takes about 3 turns. Beyond that the model is
+    // usually casting around for something the wiki does not contain, and a
+    // small model will exhaust its context around turn 8 — so both the limit
+    // and the warning sit below that, or neither would ever be reached.
+    max_turns: 8,
+    warn_at: 5,
+    exhausted: Exhausted::Report(
+        "I could not find an answer in the wiki. I searched but did not find \
+         anything covering this, so it is probably not recorded — or it is \
+         phrased differently than I looked for.",
+    ),
+    warning: "You have {remaining} searches left before this run is stopped. If \
+              you have not found the answer by now, the wiki probably does not \
+              contain it — say so plainly with `answer`. Telling the user the \
+              wiki does not cover something is a correct and useful answer; \
+              guessing from related facts is not.",
 };
 
 #[derive(Debug)]
@@ -78,6 +122,8 @@ struct Record {
     usage: Usage,
     turns: usize,
     result: Option<String>,
+    /// Remaining-turn count at the last warning, so each is issued once.
+    warned_at: Option<usize>,
 }
 
 /// Everything a step may touch. `StateMachine` hands `&Session` to each
@@ -173,7 +219,12 @@ fn calls(request: &ToolRequest, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Stop before an agent with write access runs away.
+/// Stop before an agent runs away, and warn it as the limit approaches.
+///
+/// Hitting the limit is a failure: the run is discarded and the user waited for
+/// nothing. Telling the model how many turns remain lets it land somewhere
+/// useful instead — a partial summary, or an honest "the wiki does not say".
+/// Without this a small model will happily search until it exhausts its context.
 struct MaxTurnsOperation;
 
 #[async_trait]
@@ -185,14 +236,56 @@ impl Operation<Session, ConversationEffect> for MaxTurnsOperation {
     async fn run(
         &self,
         session: &Session,
-        _conversation: &Conversation,
+        conversation: &Conversation,
         _emit: &Emitter,
     ) -> Result<OperationResult<ConversationEffect>> {
-        let limit = session.role.max_turns;
-        if session.record.lock().unwrap().turns >= limit {
-            bail!("gave up after {limit} turns without finishing");
+        let role = session.role;
+        let mut record = session.record.lock().unwrap();
+        if record.turns >= role.max_turns {
+            return match role.exhausted {
+                Exhausted::Fail => bail!(
+                    "gave up after {} turns without finishing",
+                    role.max_turns
+                ),
+                Exhausted::Report(text) => {
+                    // Only if nothing was answered: a model that answered and
+                    // then kept talking has still answered.
+                    if record.result.is_none() {
+                        record.result = Some(text.to_string());
+                    }
+                    drop(record);
+                    Ok(OperationResult::Applied(StepResult {
+                        effects: Vec::new(),
+                        applied_step: None,
+                        yield_to_client: true,
+                    }))
+                }
+            };
         }
-        not_applicable()
+
+        let remaining = role.max_turns - record.turns;
+        if remaining > role.warn_at || record.warned_at == Some(remaining) {
+            return not_applicable();
+        }
+        drop(record);
+
+        // Never nag a model that has stopped asking for tools. Warning after a
+        // prose reply restarts a finished conversation, and the model — having
+        // already answered — spends the rest of its budget saying so.
+        if ends_turn(conversation.messages()) {
+            return not_applicable();
+        }
+        let mut record = session.record.lock().unwrap();
+        // Once per turn, not once per run: a model that ignores the first
+        // warning should see the number fall.
+        record.warned_at = Some(remaining);
+        drop(record);
+
+        let text = role.warning.replace("{remaining}", &remaining.to_string());
+        session.reporter.warn(&text);
+        applied([ConversationEffect::AppendMessage(
+            Message::user().with_text(text),
+        )])
     }
 }
 
@@ -636,19 +729,184 @@ mod tests {
         );
     }
 
+    /// The model must be told the limit is coming, in the conversation itself
+    /// — a model that cannot see the budget cannot spend it well.
     #[test]
-    fn the_turn_limit_is_enforced() {
+    fn the_model_is_warned_as_the_limit_approaches() {
         let dir = Dir::new();
         let backend = ScriptedBackend::new(
             (0..30)
                 .map(|_| ScriptedBackend::tool_call("list_pages", serde_json::json!({})))
                 .collect(),
         );
+        let handle = backend.clone();
+
         let workspace = Workspace::new(dir.path()).unwrap();
-        let error = Agent::new(backend, ASK)
+        let _ = Agent::new(backend, ASK).run(workspace, "loop");
+
+        let rendered = handle
+            .last_messages()
+            .iter()
+            .map(|message| message.as_concat_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("searches left"),
+            "no warning reached the model: {rendered}"
+        );
+        assert!(
+            rendered.contains("does not cover something is a correct"),
+            "the warning should tell it that admitting ignorance is fine"
+        );
+    }
+
+    /// Counting down matters: a model that ignored "4 left" should see "3 left".
+    #[test]
+    fn the_warning_counts_down() {
+        let dir = Dir::new();
+        let backend = ScriptedBackend::new(
+            (0..30)
+                .map(|_| ScriptedBackend::tool_call("list_pages", serde_json::json!({})))
+                .collect(),
+        );
+        let handle = backend.clone();
+
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let _ = Agent::new(backend, ASK).run(workspace, "loop");
+
+        let rendered = handle
+            .last_messages()
+            .iter()
+            .map(|message| message.as_concat_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in ["4 searches left", "3 searches left", "1 searches left"] {
+            assert!(rendered.contains(expected), "missing {expected:?}");
+        }
+    }
+
+    /// A run that finishes early should never see a warning.
+    #[test]
+    fn a_short_run_is_not_warned() {
+        let dir = Dir::new();
+        let backend = ScriptedBackend::new(vec![ScriptedBackend::tool_call(
+            "answer",
+            serde_json::json!({"text": "done"}),
+        )]);
+        let handle = backend.clone();
+
+        let workspace = Workspace::new(dir.path()).unwrap();
+        Agent::new(backend, ASK).run(workspace, "quick").unwrap();
+
+        let rendered = handle
+            .last_messages()
+            .iter()
+            .map(|message| message.as_concat_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("searches left"), "{rendered}");
+    }
+
+
+
+    fn looping_backend() -> std::sync::Arc<ScriptedBackend> {
+        ScriptedBackend::new(
+            (0..40)
+                .map(|_| ScriptedBackend::tool_call("list_pages", serde_json::json!({})))
+                .collect(),
+        )
+    }
+
+    /// A build that runs out has written pages without knowing whether they are
+    /// consistent, so it must fail and leave the cursor alone.
+    #[test]
+    fn an_exhausted_build_fails() {
+        let dir = Dir::new();
+        let mut workspace = Workspace::new(dir.path()).unwrap();
+        workspace.writable = true;
+        let error = Agent::new(looping_backend(), BUILD)
             .run(workspace, "loop")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("16 turns"), "{error}");
+        assert!(
+            error.contains(&format!("{} turns", BUILD.max_turns)),
+            "{error}"
+        );
+    }
+
+    /// A question that runs out has an answer: the wiki does not say. Reporting
+    /// that is more useful than an error the user cannot act on.
+    #[test]
+    fn an_exhausted_question_reports_that_it_found_nothing() {
+        let dir = Dir::new();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let (outcome, _) = Agent::new(looping_backend(), ASK)
+            .run(workspace, "loop")
+            .expect("running out of searches is not an error for a question");
+        assert!(
+            outcome.result.contains("could not find an answer"),
+            "{}",
+            outcome.result
+        );
+        assert_eq!(outcome.turns, ASK.max_turns, "the budget was spent");
+    }
+
+    /// A model that has answered must not be nagged: warning after a prose
+    /// reply restarts a finished conversation, and the model spends the rest of
+    /// its budget explaining that it already answered.
+    #[test]
+    fn a_model_that_has_finished_is_not_warned() {
+        let dir = Dir::new();
+        // Enough tool calls to reach the warning zone, then a prose reply.
+        let mut script: Vec<_> = (0..ASK.max_turns - ASK.warn_at)
+            .map(|_| ScriptedBackend::tool_call("list_pages", serde_json::json!({})))
+            .collect();
+        script.push(ScriptedBackend::text("Biscuit is a beagle."));
+        let backend = ScriptedBackend::new(script);
+
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let (outcome, _) = Agent::new(backend, ASK).run(workspace, "who?").unwrap();
+
+        assert!(
+            outcome.result.contains("beagle"),
+            "the answer was discarded: {}",
+            outcome.result
+        );
+        assert!(
+            outcome.turns < ASK.max_turns,
+            "the run should stop when the model answers, not burn its budget"
+        );
+    }
+
+    /// Exhausting the budget must not overwrite an answer already given.
+    #[test]
+    fn an_answer_survives_running_out_of_turns() {
+        let dir = Dir::new();
+        let mut script = vec![ScriptedBackend::tool_call(
+            "answer",
+            serde_json::json!({"text": "Porto."}),
+        )];
+        script.extend(
+            (0..40).map(|_| ScriptedBackend::tool_call("list_pages", serde_json::json!({}))),
+        );
+        let backend = ScriptedBackend::new(script);
+
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let (outcome, _) = Agent::new(backend, ASK).run(workspace, "where?").unwrap();
+        assert_eq!(outcome.result, "Porto.");
+    }
+
+    /// The warning has to fit inside the budget, or it can never fire.
+    #[test]
+    fn every_role_warns_before_it_gives_up() {
+        for role in [BUILD, ASK] {
+            assert!(
+                role.warn_at < role.max_turns,
+                "a warning at {} turns remaining never fires with a {} turn limit",
+                role.warn_at,
+                role.max_turns
+            );
+            assert!(role.warning.contains("{remaining}"));
+        }
     }
 }

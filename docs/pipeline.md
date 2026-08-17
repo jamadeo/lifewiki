@@ -236,3 +236,37 @@ a stand-in for it.
   Leaning: explicit only, with `lw status` nudging.
 - **D10 / D11** from [decisions.md](decisions.md) now become live: how many
   `sources` a page keeps, and whether hand-edits are permitted.
+
+
+## Turn budgets
+
+Each role has a turn limit, and is told when it is running out:
+
+| role | limit | warns at | on exhaustion |
+|------|------:|---------:|---------------|
+| build | 16 | 8 remaining | fail; the cursor does not advance |
+| ask | 8 | 5 remaining | report that nothing was found |
+
+The numbers come from measurement, not intuition. An answerable question takes
+about 3 turns and a build 5–6; a small local model exhausts its 36k context
+around turn 8, so a limit above that would never be reached — the run would die
+of context first, which is a worse failure because it produces nothing.
+
+The warning is appended to the conversation as a user message and counts down,
+so a model that ignores "4 left" sees "3 left". It is deliberately *not* sent
+once as a system instruction: a model that has already started casting around
+needs the pressure to increase.
+
+Exhaustion means different things for the two roles. A build that runs out has
+written pages without knowing whether they are consistent, so it fails and
+leaves the cursor alone for a later build to retry. A question that runs out
+*has* an answer — the wiki does not appear to say — and reporting that is more
+useful than an error.
+
+Two rules keep this from misfiring, both found by watching real runs:
+
+- **Never warn a model that has stopped calling tools.** The warning is a new
+  user message, so warning after a prose reply restarts a finished conversation;
+  the model then spends its whole budget explaining that it already answered.
+- **Never let exhaustion overwrite an answer.** A model that answers and then
+  keeps talking has still answered.

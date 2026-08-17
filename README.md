@@ -234,9 +234,9 @@ Known gaps:
   the agent's legitimate habit of linking a page it is about to create, so
   `lw build` and `lw doctor` warn instead.
 - **Small local models struggle with `ask`.** Reconciliation and question
-  answering both need many well-formed tool calls; a small model will sometimes
-  keep searching rather than concluding a fact is absent, and exhaust its
-  context.
+  answering both need many well-formed tool calls. A small model will sometimes
+  keep searching rather than concluding a fact is absent; the turn budget bounds
+  this, but the answer is then "I could not find it" rather than a real one.
 - **No `index.md` in subdirectories.** Only the bundle root gets one, though OKF
   permits them at any level.
 - **No transcripts.** Runs narrate themselves as they go, but nothing is kept
