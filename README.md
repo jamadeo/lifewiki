@@ -239,6 +239,8 @@ Known gaps:
 - [`docs/event-log.md`](docs/event-log.md) — the log format and its contract
 - [`docs/wiki-format.md`](docs/wiki-format.md) — wiki pages as an OKF subset
 - [`docs/pipeline.md`](docs/pipeline.md) — what reconciliation has to solve
+- [`docs/daemon.md`](docs/daemon.md) — proposed: keeping the local model loaded
+  between commands
 - [`docs/review.md`](docs/review.md) — where the project outgrew the idea, and
   what to cut
 - [`docs/decisions.md`](docs/decisions.md) — 40 decisions, with rejected
