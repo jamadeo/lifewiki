@@ -76,7 +76,7 @@ pub const BUILD: Role = Role {
     // large batch of events legitimately needs more, but the warning starts
     // well before it.
     max_turns: 16,
-    warn_at: 8,
+    warn_at: 4,
     exhausted: Exhausted::Fail,
     warning: "You have {remaining} turns left before this run is stopped. Finish \
               the most important edits now and call `finish`. A partial, \
@@ -95,7 +95,11 @@ pub const ASK: Role = Role {
     // small model will exhaust its context around turn 8 — so both the limit
     // and the warning sit below that, or neither would ever be reached.
     max_turns: 8,
-    warn_at: 5,
+    // A normal question resolves in about 3 turns, so warning at 5 remaining
+    // fired on the *third* turn of a healthy run and derailed it: the model
+    // replied to the warning instead of the question. Only warn once a run is
+    // clearly overrunning.
+    warn_at: 2,
     exhausted: Exhausted::Report(
         "I could not find an answer in the wiki. I searched but did not find \
          anything covering this, so it is probably not recorded — or it is \
@@ -780,8 +784,9 @@ mod tests {
             .map(|message| message.as_concat_text())
             .collect::<Vec<_>>()
             .join("\n");
-        for expected in ["4 searches left", "3 searches left", "1 searches left"] {
-            assert!(rendered.contains(expected), "missing {expected:?}");
+        for remaining in (1..=ASK.warn_at).rev() {
+            let expected = format!("{remaining} searches left");
+            assert!(rendered.contains(&expected), "missing {expected:?}");
         }
     }
 

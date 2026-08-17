@@ -244,8 +244,8 @@ Each role has a turn limit, and is told when it is running out:
 
 | role | limit | warns at | on exhaustion |
 |------|------:|---------:|---------------|
-| build | 16 | 8 remaining | fail; the cursor does not advance |
-| ask | 8 | 5 remaining | report that nothing was found |
+| build | 16 | 4 remaining | fail; the cursor does not advance |
+| ask | 8 | 2 remaining | report that nothing was found |
 
 The numbers come from measurement, not intuition. An answerable question takes
 about 3 turns and a build 5–6; a small local model exhausts its 36k context
@@ -268,5 +268,10 @@ Two rules keep this from misfiring, both found by watching real runs:
 - **Never warn a model that has stopped calling tools.** The warning is a new
   user message, so warning after a prose reply restarts a finished conversation;
   the model then spends its whole budget explaining that it already answered.
+- **Warn late.** An earlier version warned with 5 of 8 turns remaining, which
+  fired on the third turn of a *healthy* question and derailed it — the model
+  replied to the warning ("I understand, I will use my remaining searches
+  carefully") instead of answering. A warning is an interruption, so it must
+  only arrive once a run is clearly overrunning.
 - **Never let exhaustion overwrite an answer.** A model that answers and then
   keeps talking has still answered.
