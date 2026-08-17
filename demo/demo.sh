@@ -55,9 +55,18 @@ run() {
         printf '\n'
     fi
     sleep 0.3
-    "$@"
+    # A failure here should not end the take: the agent is non-deterministic and
+    # a missing page is better shown than fatal.
+    "$@" || printf '%s(command failed)%s\n' "$dim" "$off"
     printf '\n'
     sleep "$PAUSE"
+}
+
+# The agent chooses its own paths, and may write several pages in one build. Find
+# the page *about Ada* rather than assuming /people/ada.md or taking whichever
+# file grep happens to reach first.
+find_ada() {
+    grep -rl '^title: Ada' "$LIFEWIKI_HOME/wiki" 2>/dev/null | head -1
 }
 
 # A narrator line, so a viewer knows why the next command matters.
@@ -89,17 +98,25 @@ if [[ "$PROVIDER" == "local" ]]; then
     sed -i '' 's/provider = "anthropic"/provider = "local"/g; /^name = /d' \
         "$LIFEWIKI_HOME/config.toml"
 
-    # Load the model before recording starts, or the first command sits for a
-    # minute loading 17 GB, which says nothing about the tool. This has to
-    # happen in the demo's own home, since the daemon is per-repo.
-    printf '%swarming up the local model…%s\n' "$dim" "$off"
-    "$LW" add "warmup" >/dev/null
-    "$LW" build -q >/dev/null 2>&1 || true
-    reset_repo
+    # Load the model before the demo proper, or the first command sits for a
+    # minute loading 17 GB. This has to happen in the demo's own home, since the
+    # daemon is per-repo.
+    #
+    # SKIP_WARMUP=1 means someone already did this (see demo/record.sh), which
+    # keeps a minute of nothing out of the recording.
+    if [[ "${SKIP_WARMUP:-0}" != "1" ]]; then
+        printf '%swarming up the local model…%s\n' "$dim" "$off"
+        "$LW" add "warmup" >/dev/null
+        "$LW" build -q >/dev/null 2>&1 || true
+        reset_repo
+    fi
 fi
 
-# Leave no daemon behind when the demo ends: it would hold ~17 GB.
-trap '"$LW" daemon stop >/dev/null 2>&1 || true' EXIT
+# Leave no daemon behind when the demo ends: it would hold ~17 GB. When a
+# recording wrapper owns the daemon it stops it itself, so skip that here.
+if [[ "${KEEP_DAEMON:-0}" != "1" ]]; then
+    trap '"$LW" daemon stop >/dev/null 2>&1 || true' EXIT
+fi
 
 clear
 
@@ -118,19 +135,30 @@ say "Each entry is committed to git the moment it exists."
 
 run "$LW" log
 
+say "Now fold the log into a wiki."
+
+run "$LW" build
+
+say "It made a page for Ada. Note where it says she lives."
+
+# Show the claims before the contradiction arrives, so the rewrite is visible.
+# Only the prose: the frontmatter is shown in full after the second build.
+ada_page="$(find_ada)"
+if [[ -n "$ada_page" ]]; then
+    run sed -n '/^# /,$p' "$ada_page"
+fi
+
 say "Facts change. You don't edit anything — you just say what's true now."
 
 run "$LW" add "Ada moved to Porto last month."
 
-say "Now fold the log into the wiki. Watch it find the contradiction."
+say "Build again. It has to notice this contradicts the page it just wrote."
 
 run "$LW" build
 
-say "It rewrote Ada's page rather than adding a second, conflicting one."
+say "It rewrote the page rather than adding a second, conflicting one."
 
-# The agent chooses its own paths, so find the page rather than assuming
-# /people/ada.md. A take should not fail because it picked /family/.
-ada_page="$(grep -rl -i 'title:.*Ada' "$LIFEWIKI_HOME/wiki" 2>/dev/null | head -1)"
+ada_page="$(find_ada)"
 if [[ -n "$ada_page" ]]; then
     run cat "$ada_page"
 else

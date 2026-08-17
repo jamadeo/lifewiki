@@ -244,8 +244,15 @@ Known gaps:
 
 ## Demo
 
-`demo/demo.sh` records a ~70 second walkthrough — capture, build, ask — against
-a throwaway repo. See [`demo/README.md`](demo/README.md).
+A ~60 second walkthrough: capture two notes, build a wiki, contradict one of
+them, watch the page get rewritten, then ask a question.
+
+```sh
+./demo/record.sh                        # record it
+asciinema play demo/lifewiki.cast       # watch it
+```
+
+Runs against a throwaway repo in `/tmp`. See [`demo/README.md`](demo/README.md).
 
 ## Documentation
 

@@ -12,23 +12,29 @@ It runs against `/tmp/lifewiki-demo` and never touches `~/.lifewiki`.
 
 ## Recording
 
-No recorder is installed here. [asciinema](https://asciinema.org) gives the
-smallest artifact and copy-pasteable text:
-
 ```sh
-brew install asciinema
-asciinema rec -c ./demo/demo.sh lifewiki.cast
-asciinema upload lifewiki.cast
+./demo/record.sh          # writes demo/lifewiki.cast, ~60s playback
+asciinema play demo/lifewiki.cast
+asciinema upload demo/lifewiki.cast
 ```
 
-For a GIF, [vhs](https://github.com/charmbracelet/vhs) or `agg`:
+`record.sh` rather than `asciinema rec -c ./demo/demo.sh` directly, because it
+does two things that matter:
+
+- **Warms the model up first.** Otherwise the recording opens with a minute of
+  silence while 17 GB loads, which says nothing about the tool.
+- **Caps idle time at 0.8s.** The model sometimes thinks for 45 seconds. The cap
+  is metadata, so the captured timings are untouched and it can be retuned later
+  with `IDLE=0.6` — or edited into an existing `.cast` — without re-recording.
+
+Records at 90x30. Wiki pages and indented tool output wrap badly below 80
+columns, and past ~110 the text drifts from the left edge.
+
+For a GIF:
 
 ```sh
-brew install agg && agg lifewiki.cast lifewiki.gif
+brew install agg && agg demo/lifewiki.cast demo/lifewiki.gif
 ```
-
-Use an 80–100 column terminal. Wiki pages and the agent's indented tool output
-wrap badly below 80, and above ~110 the text drifts away from the left edge.
 
 ## Knobs
 
@@ -37,6 +43,7 @@ wrap badly below 80, and above ~110 the text drifts away from the left edge.
 | `DEMO_SPEED` | `0.035` | seconds per typed character; `0` disables the animation |
 | `PAUSE` | `1.2` | beat after each command |
 | `PROVIDER` | `local` | `anthropic` to record against a hosted model |
+| `IDLE` | `0.8` | playback cap on pauses, in seconds |
 | `LW` | `target/debug/lw` | path to the binary |
 
 ## What it shows, and why in that order
