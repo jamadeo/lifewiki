@@ -145,6 +145,10 @@ enum CommandName {
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
+        /// Load the local model in this process instead of using the daemon.
+        #[cfg(feature = "local")]
+        #[arg(long)]
+        no_daemon: bool,
         /// Print only the result, without narrating the run.
         #[arg(short, long)]
         quiet: bool,
@@ -168,6 +172,10 @@ enum CommandName {
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
+        /// Load the local model in this process instead of using the daemon.
+        #[cfg(feature = "local")]
+        #[arg(long)]
+        no_daemon: bool,
         /// Print only the answer, without the searching and reading.
         #[arg(short, long)]
         quiet: bool,
@@ -193,10 +201,41 @@ enum CommandName {
         #[cfg(feature = "local")]
         #[arg(long)]
         local: bool,
+        /// Load the local model in this process instead of using the daemon.
+        #[cfg(feature = "local")]
+        #[arg(long)]
+        no_daemon: bool,
         /// Print only the result, without narrating the run.
         #[arg(short, long)]
         quiet: bool,
     },
+
+    /// Manage the local inference daemon.
+    ///
+    /// Loading a local model takes about a minute, and the loaded model dies
+    /// with the process. A daemon holds it so only the first command pays that
+    /// cost. It starts on demand; these commands are for inspecting it.
+    #[cfg(feature = "local")]
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+
+    /// Run the daemon in the foreground. Started for you; not for direct use.
+    #[cfg(feature = "local")]
+    #[command(name = "__daemon", hide = true)]
+    DaemonServe,
+}
+
+#[cfg(feature = "local")]
+#[derive(Subcommand)]
+pub enum DaemonCommand {
+    /// Show whether a daemon is running, and what it is holding.
+    Status,
+    /// Start a daemon without running a command.
+    Start,
+    /// Stop the daemon, freeing the memory its models occupy.
+    Stop,
 }
 
 pub fn run() -> Result<()> {
@@ -256,6 +295,8 @@ pub fn run() -> Result<()> {
             into,
             #[cfg(feature = "local")]
             local,
+            #[cfg(feature = "local")]
+            no_daemon,
             quiet,
         } => {
             paths::require_initialized(&home)?;
@@ -265,6 +306,10 @@ pub fn run() -> Result<()> {
                     into,
                     rebuild: false,
                     quiet,
+                    local_mode: local_mode(
+                        #[cfg(feature = "local")]
+                        no_daemon,
+                    ),
                     #[cfg(feature = "local")]
                     provider_override: local.then(|| "local".to_string()),
                     #[cfg(not(feature = "local"))]
@@ -276,6 +321,8 @@ pub fn run() -> Result<()> {
             question,
             #[cfg(feature = "local")]
             local,
+            #[cfg(feature = "local")]
+            no_daemon,
             quiet,
         } => {
             paths::require_initialized(&home)?;
@@ -283,13 +330,30 @@ pub fn run() -> Result<()> {
             let provider_override = local.then(|| "local".to_string());
             #[cfg(not(feature = "local"))]
             let provider_override: Option<String> = None;
-            ask(&home, question, provider_override, quiet)
+            ask(
+                &home,
+                question,
+                provider_override,
+                quiet,
+                local_mode(
+                    #[cfg(feature = "local")]
+                    no_daemon,
+                ),
+            )
         }
+
+        #[cfg(feature = "local")]
+        CommandName::DaemonServe => crate::daemon::serve(&home),
+
+        #[cfg(feature = "local")]
+        CommandName::Daemon { command } => daemon_command(&home, command),
         CommandName::Rebuild {
             into,
             force,
             #[cfg(feature = "local")]
             local,
+            #[cfg(feature = "local")]
+            no_daemon,
             quiet,
         } => {
             paths::require_initialized(&home)?;
@@ -305,6 +369,10 @@ pub fn run() -> Result<()> {
                     into,
                     rebuild: true,
                     quiet,
+                    local_mode: local_mode(
+                        #[cfg(feature = "local")]
+                        no_daemon,
+                    ),
                     #[cfg(feature = "local")]
                     provider_override: local.then(|| "local".to_string()),
                     #[cfg(not(feature = "local"))]
@@ -366,8 +434,10 @@ fn init(home: &Path) -> Result<()> {
 /// Untracked files that would otherwise make the tree permanently dirty and
 /// block every build.
 const GITIGNORE: &str = "\
-# Transient: the append lock.
+# Transient: the append lock and the daemon's socket and lock.
 .lock
+daemon.sock
+daemon.lock
 
 # Editor and viewer state. Obsidian writes wiki/.obsidian when a vault is
 # opened, which is not part of the wiki's content.
@@ -481,6 +551,71 @@ fn run_build(home: &Path, options: crate::build::Options) -> Result<()> {
 
 /// Report which model each task will use. Per-task config is exactly the kind
 /// of thing that silently does nothing when mistyped, so make it inspectable.
+/// Whether local inference should go through the daemon.
+fn local_mode(#[cfg(feature = "local")] no_daemon: bool) -> crate::model::LocalMode {
+    #[cfg(feature = "local")]
+    {
+        if no_daemon {
+            crate::model::LocalMode::InProcess
+        } else {
+            crate::model::LocalMode::Daemon
+        }
+    }
+    #[cfg(not(feature = "local"))]
+    crate::model::LocalMode::InProcess
+}
+
+#[cfg(feature = "local")]
+fn daemon_command(home: &Path, command: DaemonCommand) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    match command {
+        DaemonCommand::Status => match runtime.block_on(crate::daemon::probe(home)) {
+            Some(status) => {
+                println!("Running (pid {})", status.pid);
+                println!("Version:  {}", status.binary_version);
+                println!("Started:  {}", status.started_at);
+                println!("Served:   {} request(s)", status.requests_served);
+                if status.models.is_empty() {
+                    println!("Models:   none loaded yet");
+                } else {
+                    println!("Models:   {}", status.models.join(", "));
+                }
+                if status.binary_version != crate::daemon::BINARY_VERSION {
+                    println!(
+                        "\nThis binary is {}; the daemon will be restarted on next use.",
+                        crate::daemon::BINARY_VERSION
+                    );
+                }
+                Ok(())
+            }
+            None => {
+                println!("Not running.");
+                Ok(())
+            }
+        },
+        DaemonCommand::Start => {
+            if let Some(status) = runtime.block_on(crate::daemon::probe(home)) {
+                println!("Already running (pid {}).", status.pid);
+                return Ok(());
+            }
+            let status = runtime.block_on(crate::daemon::start(home))?;
+            println!("Started (pid {}).", status.pid);
+            println!("The model loads on the first request.");
+            Ok(())
+        }
+        DaemonCommand::Stop => {
+            if runtime.block_on(crate::daemon::stop(home))? {
+                println!("Stopped.");
+            } else {
+                println!("Not running.");
+            }
+            Ok(())
+        }
+    }
+}
+
 fn show_models(home: &Path) -> Result<()> {
     use crate::model::{ModelSettings, Task};
     let build = ModelSettings::load(home, Task::Build)?;
@@ -499,6 +634,7 @@ fn ask(
     question: Vec<String>,
     provider_override: Option<String>,
     quiet: bool,
+    local_mode: crate::model::LocalMode,
 ) -> Result<()> {
     let question = capture_text(question)?;
     if question.trim().is_empty() {
@@ -525,7 +661,7 @@ fn ask(
     if let Some(provider) = &provider_override {
         settings = settings.with_provider(provider);
     }
-    let backend = crate::model::build(&settings)?;
+    let backend = crate::model::build(&settings, home, local_mode)?;
 
     let mut agent = crate::agent::Agent::new(backend, crate::agent::ASK);
     if !quiet {

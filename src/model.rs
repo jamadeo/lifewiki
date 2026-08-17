@@ -156,16 +156,7 @@ impl LocalBackend {
 #[async_trait]
 impl Backend for LocalBackend {
     fn actor(&self) -> String {
-        // Keep the local/ prefix: a page's provenance should make it obvious
-        // which pages were written by a small local model.
-        format!(
-            "lifewiki/local-{}",
-            self.model_name
-                .rsplit('/')
-                .next()
-                .unwrap_or(&self.model_name)
-                .replace([':', '.'], "-")
-        )
+        local_actor(&self.model_name)
     }
 
     async fn complete(
@@ -205,6 +196,109 @@ impl Backend for LocalBackend {
 }
 
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-5";
+
+/// Talks to the daemon instead of loading the model in this process.
+///
+/// Inference is the only thing that crosses the socket; the agent loop, tools
+/// and wiki stay here. Falls back to in-process on any daemon problem, so a
+/// broken daemon degrades to today's behaviour rather than a failed command.
+#[cfg(feature = "local")]
+pub struct DaemonBackend {
+    home: std::path::PathBuf,
+    model_name: String,
+}
+
+#[cfg(feature = "local")]
+impl DaemonBackend {
+    /// Connect, starting a daemon if none is listening.
+    pub async fn connect(home: &std::path::Path, model_name: &str) -> Result<Self> {
+        match crate::daemon::probe(home).await {
+            Some(status) if status.binary_version == crate::daemon::BINARY_VERSION => {}
+            Some(status) => {
+                // An upgrade left an old daemon serving new requests. Failures
+                // from that look like model bugs, so replace it.
+                eprintln!(
+                    "restarting the daemon: it is version {}, this is {}",
+                    status.binary_version,
+                    crate::daemon::BINARY_VERSION
+                );
+                let _ = crate::daemon::stop(home).await;
+                // Give it a moment to release the socket before rebinding.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                crate::daemon::start(home).await?;
+            }
+            None => {
+                crate::daemon::start(home).await?;
+            }
+        }
+        Ok(Self {
+            home: home.to_path_buf(),
+            model_name: model_name.to_string(),
+        })
+    }
+}
+
+#[cfg(feature = "local")]
+#[async_trait]
+impl Backend for DaemonBackend {
+    fn actor(&self) -> String {
+        local_actor(&self.model_name)
+    }
+
+    async fn complete(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<(Message, Usage)> {
+        use crate::protocol::{CompleteRequest, Request, Response};
+
+        let response = crate::daemon::request(
+            &self.home,
+            Request::Complete(Box::new(CompleteRequest {
+                model: self.model_name.clone(),
+                system: system.to_string(),
+                messages: messages.to_vec(),
+                tools: tools.to_vec(),
+            })),
+        )
+        .await
+        .context("the daemon did not answer; `lw daemon stop` then retry")?;
+
+        match response {
+            Response::Completed {
+                message,
+                input_tokens,
+                output_tokens,
+            } => Ok((
+                *message,
+                Usage {
+                    input_tokens,
+                    output_tokens,
+                },
+            )),
+            // The daemon already rendered this for a human.
+            Response::Failed(error) => bail!("{error}"),
+            other => bail!("unexpected daemon response: {other:?}"),
+        }
+    }
+}
+
+/// Actor string for a local model, shared by the in-process and daemon paths.
+///
+/// The `local-` prefix stays: a page's provenance should make it obvious which
+/// pages were written by a small local model.
+#[cfg(feature = "local")]
+fn local_actor(model_name: &str) -> String {
+    format!(
+        "lifewiki/local-{}",
+        model_name
+            .rsplit('/')
+            .next()
+            .unwrap_or(model_name)
+            .replace([':', '.'], "-")
+    )
+}
 
 /// Default local model. Small enough to run on a laptop; see the note in
 /// `docs/pipeline.md` about tool-calling quality.
@@ -315,8 +409,22 @@ impl ModelSettings {
     }
 }
 
-pub fn build(settings: &ModelSettings) -> Result<Arc<dyn Backend>> {
+/// How local inference should run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalMode {
+    /// Reuse a daemon holding the loaded model, starting one if needed.
+    Daemon,
+    /// Load the model in this process.
+    InProcess,
+}
+
+pub fn build(
+    settings: &ModelSettings,
+    home: &std::path::Path,
+    local_mode: LocalMode,
+) -> Result<Arc<dyn Backend>> {
     let timeout = Duration::from_secs(settings.timeout_seconds);
+    let _ = (home, local_mode);
     match settings.provider.as_str() {
         "anthropic" => {
             let name = if settings.name.is_empty() {
@@ -334,13 +442,23 @@ pub fn build(settings: &ModelSettings) -> Result<Arc<dyn Backend>> {
             } else {
                 settings.name.clone()
             };
-            // from_env is async but build() is called from sync code, so spin a
-            // short-lived runtime just to construct the provider.
-            let backend = tokio::runtime::Builder::new_current_thread()
+            // Constructing a backend is async but build() is called from sync
+            // code, so spin a short-lived runtime for it.
+            let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
-                .build()?
-                .block_on(LocalBackend::new(&name))?;
-            Ok(Arc::new(backend))
+                .build()?;
+            match local_mode {
+                LocalMode::Daemon => match runtime.block_on(DaemonBackend::connect(home, &name)) {
+                    Ok(backend) => Ok(Arc::new(backend)),
+                    Err(error) => {
+                        // A broken daemon should cost a slow command, not a
+                        // failed one.
+                        eprintln!("could not use the daemon ({error:#}); loading in-process");
+                        Ok(Arc::new(runtime.block_on(LocalBackend::new(&name))?))
+                    }
+                },
+                LocalMode::InProcess => Ok(Arc::new(runtime.block_on(LocalBackend::new(&name))?)),
+            }
         }
 
         #[cfg(not(feature = "local"))]

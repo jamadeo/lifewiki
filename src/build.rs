@@ -59,6 +59,8 @@ pub struct Options {
     pub provider_override: Option<String>,
     /// Print only the result, without narrating the run.
     pub quiet: bool,
+    /// How local inference should run.
+    pub local_mode: crate::model::LocalMode,
 }
 
 impl Default for Options {
@@ -68,6 +70,7 @@ impl Default for Options {
             rebuild: false,
             provider_override: None,
             quiet: false,
+            local_mode: crate::model::LocalMode::Daemon,
         }
     }
 }
@@ -96,7 +99,7 @@ pub fn build(home: &Path, options: Options) -> Result<Report> {
         });
     }
 
-    let backend = model::build(&settings)?;
+    let backend = model::build(&settings, home, options.local_mode)?;
     build_with(home, options, backend)
 }
 

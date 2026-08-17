@@ -160,6 +160,15 @@ several minutes — too much to impose on someone working on the log. Model
 downloads are the [goose](https://github.com/aaif-goose/goose) CLI's job, not
 ours.
 
+The first local command starts a daemon that holds the loaded model, so later
+commands skip the ~60s load:
+
+```sh
+lw daemon status     # what it is holding
+lw daemon stop       # free the memory (a 26B model is ~17 GB resident)
+lw ask --no-daemon   # bypass it
+```
+
 Reconciliation asks a lot of a small model: many turns, well-formed tool calls
 throughout. Pages record which model wrote them (`generated.by:
 lifewiki/local-…`), so mixed-provenance wikis stay auditable.

@@ -77,12 +77,10 @@ exclusive `flock` on `daemon.lock` held for its lifetime. Two daemons racing to
 start means one wins the lock and the other exits quietly. Pidfiles go stale
 when a process is SIGKILLed and the pid is reused; a held flock cannot.
 
-**Idle timeout, default 15 minutes.** This is the decision I feel least certain
-about, and it is worth stating plainly: **the daemon holds 17 GB resident.** On
-a 32 GB machine that is half of memory held indefinitely for a tool you might
-use twice a day. Exiting after idle bounds the damage; `--idle 0` for anyone who
-would rather keep it warm. If the number is wrong, it is wrong in the direction
-of costing a reload, which is recoverable.
+**No idle timeout.** The daemon runs until stopped. Stated plainly: **it holds
+17 GB resident**, which on a 32 GB machine is half of memory held for a tool you
+might use twice a day. `lw daemon stop` frees it. An idle timeout would bound
+this automatically and remains the obvious next change.
 
 **Version check on connect.** The daemon reports the binary version it was built
 from; a mismatch makes the CLI kill and restart it. Otherwise `cargo install`
@@ -204,3 +202,39 @@ worse interface.
    request fast.
 4. **Is a 17 GB resident daemon acceptable at all**, or should this wait for a
    smaller default model? A 4 GB model would make the whole tradeoff easier.
+
+
+---
+
+## Outcome
+
+Built, behind the `local` feature. Measured on an identical question:
+
+```
+warm (daemon)      8.00s
+cold (--no-daemon) 21.62s
+```
+
+2.7x, and the daemon shows 17 GB resident across commands with the model loaded
+once. `lw daemon status` reports what it is holding.
+
+Verified by hand, since these are the parts that fail in practice:
+
+| case | behaviour |
+|---|---|
+| No daemon | autostarts, first request loads the model |
+| `SIGKILL`, stale socket left behind | `status` says not running; next command binds fresh |
+| Second daemon started | loses the lock race and exits, original untouched |
+| `lw daemon stop` | exits, socket removed |
+| Hosted provider | no socket created; the daemon is only for `--local` |
+| Daemon unreachable | falls back to in-process with a warning |
+
+One measurement worth recording, because it nearly misled me: comparing whole
+`lw build` runs showed 57s cold against 69s warm, which looks like the daemon
+making things *slower*. It was variance in how much the model chose to generate,
+not overhead. Comparing a fixed question is what showed the real effect.
+
+The socket path (autostart, singleton, version mismatch, stale socket, error
+propagation) is covered by seven tests using `ScriptedBackend`, so none of it
+needs a GPU. Only "the real model stays loaded" needs hardware, and that was
+verified by hand.
