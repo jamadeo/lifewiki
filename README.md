@@ -242,6 +242,11 @@ Known gaps:
 - **No transcripts.** Runs narrate themselves as they go, but nothing is kept
   afterwards; a build's commit message is the durable record.
 
+## Demo
+
+`demo/demo.sh` records a ~70 second walkthrough — capture, build, ask — against
+a throwaway repo. See [`demo/README.md`](demo/README.md).
+
 ## Documentation
 
 - [`docs/design.md`](docs/design.md) — architecture and principles

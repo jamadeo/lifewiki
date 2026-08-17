@@ -108,11 +108,25 @@ pub fn serve(home: &Path) -> Result<()> {
             let state = Arc::new(Mutex::new(State::new()));
             let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
 
+            // A daemon whose repository has been deleted has nothing to serve,
+            // and would otherwise hold its models forever. Nothing reconnects
+            // to it, so nothing would ever notice.
+            let mut orphan_check = tokio::time::interval(std::time::Duration::from_secs(10));
+            orphan_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let watched = socket.clone();
+
             loop {
                 tokio::select! {
                     _ = stop_rx.recv() => break,
                     // Ctrl-C and `kill` should still clean up the socket.
                     _ = tokio::signal::ctrl_c() => break,
+                    _ = orphan_check.tick() => {
+                        if !watched.exists() {
+                            eprintln!("socket is gone; the repository was removed or reset");
+                            break;
+                        }
+                        continue;
+                    }
                     accepted = listener.accept() => {
                         let (stream, _) = accepted.context("accept failed")?;
                         let state = state.clone();
@@ -441,6 +455,37 @@ mod tests {
         let dir = crate::tools::tests::tempdir::Dir::new();
         std::fs::write(socket_path(dir.path()), b"").unwrap();
         assert!(probe(dir.path()).await.is_none());
+    }
+
+    /// A daemon whose repository is deleted must exit, not hold its models
+    /// forever. Nothing reconnects to such a daemon, so nothing else would
+    /// notice — 19 of them once accumulated here, ~300 GB of allocations.
+    #[tokio::test]
+    async fn a_daemon_exits_when_its_socket_disappears() {
+        let dir = crate::tools::tests::tempdir::Dir::new();
+        let home = dir.path().to_path_buf();
+        let socket = socket_path(&home);
+
+        // Mirrors the orphan check in `serve`.
+        let watcher = tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(std::time::Duration::from_millis(10));
+            loop {
+                ticks.tick().await;
+                if !socket.exists() {
+                    return "exited";
+                }
+            }
+        });
+
+        std::fs::write(socket_path(&home), b"").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        std::fs::remove_file(socket_path(&home)).unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), watcher)
+            .await
+            .expect("the daemon should notice its socket is gone")
+            .unwrap();
+        assert_eq!(result, "exited");
     }
 
     #[tokio::test]

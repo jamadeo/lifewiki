@@ -126,6 +126,12 @@ Each of these is a real thing that will happen, not a hypothetical:
 | Autostart fails (no `local` feature) | fall back to in-process, which is the current behaviour |
 | Two CLIs at once | one holds the lock and serves both; requests queue |
 
+**Its repository is deleted.** The daemon checks every 10 seconds that its
+socket still exists and exits when it does not. Without this a daemon whose home
+was removed ran forever holding its models, and nothing would ever reconnect to
+notice: 19 of them accumulated during testing, ~300 GB of allocations on a 64 GB
+machine, until inference started failing with `Decode Error -3`.
+
 **Deliberately not handled:** a daemon wedged but still accepting connections.
 Detecting that needs heartbeats and a supervisor, which is more machinery than
 the problem deserves. `lw daemon stop` is the escape hatch.
