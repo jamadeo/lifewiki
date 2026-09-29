@@ -23,8 +23,8 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use goose_agent::machine::{EffectHandler, MachineSession, SessionLoader, StateMachine, Step};
 use goose_agent::operation::{
-    applied, ends_turn, not_applicable, ConversationEffect, Emitter, Inference, InferenceInput,
-    Operation, OperationResult, StepResult,
+    applied, ends_turn, not_applicable, yielded, yielded_with, ConversationEffect, Emitter,
+    Inference, InferenceInput, Operation, OperationResult,
 };
 use goose_providers::conversation::message::{Message, MessageContent, ToolRequest};
 use goose_providers::conversation::Conversation;
@@ -258,11 +258,7 @@ impl Operation<Session, ConversationEffect> for MaxTurnsOperation {
                         record.result = Some(text.to_string());
                     }
                     drop(record);
-                    Ok(OperationResult::Applied(StepResult {
-                        effects: Vec::new(),
-                        applied_step: None,
-                        yield_to_client: true,
-                    }))
+                    yielded()
                 }
             };
         }
@@ -338,11 +334,7 @@ impl Operation<Session, ConversationEffect> for TerminalOperation {
             request.id.clone(),
             Ok(CallToolResult::success(vec![ContentBlock::text("Done.")])),
         );
-        Ok(OperationResult::Applied(StepResult {
-            effects: vec![ConversationEffect::AppendMessage(response)],
-            applied_step: None,
-            yield_to_client: true,
-        }))
+        yielded_with([ConversationEffect::AppendMessage(response)])
     }
 }
 
@@ -374,11 +366,7 @@ impl Operation<Session, ConversationEffect> for EndTurnOperation {
                 .unwrap_or_default();
             record.result = Some(text.trim().to_string());
         }
-        Ok(OperationResult::Applied(StepResult {
-            effects: Vec::new(),
-            applied_step: None,
-            yield_to_client: true,
-        }))
+        yielded()
     }
 }
 
