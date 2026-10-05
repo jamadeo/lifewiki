@@ -3,6 +3,7 @@ name = "lifewiki"
 version = "0.1.0"
 edition = "2021"
 description = "A local-first event log"
+license = "MIT"
 
 [[bin]]
 name = "lw"
